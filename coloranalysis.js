@@ -42,7 +42,6 @@ function createCDF(hist) {
     cumulative += hist[i];
     cdf[i] = cumulative / safeTotal;
   }
-
   return cdf;
 }
 
