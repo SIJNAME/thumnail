@@ -1,0 +1,49 @@
+{
+  "face_ratio": 9.29,
+  "subject_position_x": 14.36,
+  "color_saturation_level": 69,
+  "contrast_strength": 71,
+  "emotion_intensity_avg": 80,
+  "background_blur_level": 23.5,
+  "object_density": 51,
+  "avg_rgb": [
+    105,
+    109,
+    98
+  ],
+  "brightness_mean": 97,
+  "saturation_mean": 80,
+  "negative_space_ratio": 12.12,
+  "horizon_line_estimate": 5.19,
+  "camera_distance_estimate": 20.81,
+  "dominant_art_style": "photorealistic",
+  "dominant_render_type": "3D game render",
+  "dominant_distortion": "normal proportion",
+  "dominant_color_palette": "warm cinematic",
+  "channel_id": "UChjKDMnMMG6iZY3twuuS2zg",
+  "niche_profile": {
+    "niche": "Gaming & Commentary",
+    "primary_topic": "Video game playthroughs and survival scenarios, with a comedic twist",
+    "common_objects": [
+      "Quarantine zones",
+      "Zombie infection",
+      "Fishing",
+      "Political context",
+      "Gameplay mechanics"
+    ],
+    "emotion_baseline": "Humor and light-heartedness amidst tense or absurd situations",
+    "style_profile": "Casual, engaging, interactive; includes audience participation through likes and subscriptions",
+    "visual_theme": "Colorful and dynamic, likely featuring game graphics and action-packed sequences with a playful tone"
+  },
+  "sample_size": 10,
+  "avg_visual_ctr": 75,
+  "avg_face_score": 82,
+  "avg_emotion_score": 84,
+  "avg_color_score": 71,
+  "avg_readability_score": 79,
+  "analyzed_at": "2026-02-28T20:46:55.237Z",
+  "dominant_lighting_style": "dramatic",
+  "dominant_composition_style": "dynamic",
+  "dominant_text_position": "top left",
+  "avg_realism_level": 73
+}

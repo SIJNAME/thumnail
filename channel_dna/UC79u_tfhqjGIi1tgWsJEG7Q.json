@@ -1,0 +1,14 @@
+{
+  "channel_id": "UC79u_tfhqjGIi1tgWsJEG7Q",
+  "sample_size": 11,
+  "avg_visual_ctr": 72,
+  "avg_face_score": 77,
+  "avg_emotion_score": 87,
+  "avg_color_score": 76,
+  "avg_readability_score": 75,
+  "analyzed_at": "2026-02-27T15:49:14.659Z",
+  "dominant_lighting_style": "Bright and vibrant",
+  "dominant_composition_style": "Centered with background elements",
+  "dominant_text_position": "Top and focal",
+  "avg_realism_level": 59
+}
