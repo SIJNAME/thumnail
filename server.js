@@ -1,12 +1,12 @@
 require("dotenv").config();
 
 if (!process.env.OPENAI_API_KEY) {
-  console.error("Missing OPENAI_API_KEY");
+  process.stderr.write("Missing OPENAI_API_KEY\n");
   process.exit(1);
 }
 
 if (!process.env.YOUTUBE_API_KEY) {
-  console.error("Missing YOUTUBE_API_KEY");
+  process.stderr.write("Missing YOUTUBE_API_KEY\n");
   process.exit(1);
 }
 
@@ -16,7 +16,7 @@ const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
 const OpenAI = require("openai");
-const { matchHistogram, getHistogram } = require("./coloranalysis");
+const { matchHistogram, getHistogram, colorTransfer } = require("./coloranalysis");
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const app = express();
@@ -58,6 +58,119 @@ class Semaphore {
 }
 
 const comfySemaphore = new Semaphore(2);
+const LLM_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
+
+function log(level, message, metadata = {}) {
+  const payload = {
+    ts: new Date().toISOString(),
+    level,
+    message,
+    ...metadata,
+  };
+  const line = JSON.stringify(payload);
+  if (level === "error") process.stderr.write(`${line}\n`);
+  else process.stdout.write(`${line}\n`);
+}
+
+async function callLLM({ messages, json = false }) {
+  const maxRetries = 2;
+
+  for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
+    try {
+      return await openai.chat.completions.create({
+        model: LLM_MODEL,
+        ...(json ? { response_format: { type: "json_object" } } : {}),
+        messages,
+      });
+    } catch (err) {
+      log("error", "LLM call failed", {
+        attempt,
+        status: err?.status || err?.response?.status,
+        code: err?.code,
+        name: err?.name,
+      });
+      if (attempt === maxRetries) throw err;
+      await new Promise((r) => setTimeout(r, 350 * (attempt + 1)));
+    }
+  }
+  return null;
+}
+
+function buildSystemFlowOverview() {
+  return [
+    {
+      id: 1,
+      module: "Channel DNA Analyzer",
+      does: "Fetch latest YouTube thumbnails and analyze visual composition with Vision AI.",
+      outputs: [
+        "face_bbox",
+        "text_bbox",
+        "avg_color_stats",
+        "contrast_strength",
+        "emotion_intensity_avg",
+        "negative_space_map_64x36",
+        "dominant_channel_style",
+      ],
+      result: "Create per-channel DNA baseline for future generation.",
+    },
+    {
+      id: 2,
+      module: "Content Intelligence Analyzer",
+      does: "Analyze video title/description to infer category, mood, focus, and text hooks.",
+      outputs: ["category", "mood", "focus", "text_variations"],
+      result: "Provide content-fit thumbnail direction and multiple headline options.",
+    },
+    {
+      id: 3,
+      module: "Smart Prompt Builder",
+      does: "Merge Channel DNA + content analysis and enforce layout/typography constraints.",
+      outputs: ["channel-specific_prompt", "text_position_guidance", "no_face_overlap_rules"],
+      result: "Produce channel-specific prompt instructions.",
+    },
+    {
+      id: 4,
+      module: "AI Thumbnail Generator (ComfyUI)",
+      does: "Inject prompts into SDXL workflow (model/LoRA) and generate multi-seed variations.",
+      outputs: ["thumbnail_variations"],
+      result: "Create multiple candidate thumbnails.",
+    },
+    {
+      id: 5,
+      module: "Color Matching System",
+      does: "Apply Histogram Matching then RGB Mean/Std Transfer.",
+      outputs: ["brand-consistent_color_tone"],
+      result: "Generated images look aligned with channel color identity.",
+    },
+    {
+      id: 6,
+      module: "Vision CTR Scoring System",
+      does: "Score generated images by CTR potential and visual quality metrics.",
+      outputs: ["visual_ctr_score", "emotion_score", "readability_score", "face_score"],
+      result: "Rank image candidates by click potential.",
+    },
+    {
+      id: 7,
+      module: "Text-Face Overlap Guard",
+      does: "Check text/face overlap and reject variants above threshold.",
+      outputs: ["filtered_variations"],
+      result: "Avoid unreadable headlines and face obstruction.",
+    },
+    {
+      id: 8,
+      module: "Winner Selection",
+      does: "Choose highest-vision-score thumbnail and return all variations.",
+      outputs: ["winner", "thumbnails"],
+      result: "Return best candidate plus alternatives.",
+    },
+    {
+      id: 9,
+      module: "Self-Learning DNA Update",
+      does: "Blend winner stats back into Channel DNA via alpha update.",
+      outputs: ["updated_channel_dna"],
+      result: "Closed-loop optimization over time.",
+    },
+  ];
+}
 
 function clamp(v, lo, hi) {
   return Math.max(lo, Math.min(hi, v));
@@ -88,49 +201,6 @@ async function youtubeGet(url, params) {
     if (msg) throw new Error(msg);
     throw err;
   }
-}
-
-async function getMeanStd(imageBuffer) {
-  const { data, info } = await sharp(imageBuffer).removeAlpha().raw().toBuffer({ resolveWithObject: true });
-  const channels = info.channels;
-  const pixels = info.width * info.height;
-  const stats = {
-    r: { sum: 0, sqSum: 0 },
-    g: { sum: 0, sqSum: 0 },
-    b: { sum: 0, sqSum: 0 },
-  };
-
-  for (let i = 0; i < data.length; i += channels) {
-    const r = data[i];
-    const g = data[i + 1];
-    const b = data[i + 2];
-    stats.r.sum += r;
-    stats.g.sum += g;
-    stats.b.sum += b;
-    stats.r.sqSum += r * r;
-    stats.g.sqSum += g * g;
-    stats.b.sqSum += b * b;
-  }
-
-  const calc = (c) => {
-    const mean = c.sum / pixels;
-    const variance = c.sqSum / pixels - mean * mean;
-    return { mean, std: Math.sqrt(Math.max(variance, 1)) };
-  };
-
-  return { r: calc(stats.r), g: calc(stats.g), b: calc(stats.b) };
-}
-
-async function colorTransfer(imageBuffer, targetStats, weight = 0.4) {
-  const source = await getMeanStd(imageBuffer);
-  const safe = (v) => (v === 0 ? 1 : v);
-  const scaleR = 1 + weight * (targetStats.r.std / safe(source.r.std) - 1);
-  const scaleG = 1 + weight * (targetStats.g.std / safe(source.g.std) - 1);
-  const scaleB = 1 + weight * (targetStats.b.std / safe(source.b.std) - 1);
-  const shiftR = weight * (targetStats.r.mean - source.r.mean);
-  const shiftG = weight * (targetStats.g.mean - source.g.mean);
-  const shiftB = weight * (targetStats.b.mean - source.b.mean);
-  return sharp(imageBuffer).linear([scaleR, scaleG, scaleB], [shiftR, shiftG, shiftB]).toBuffer();
 }
 
 function mostCommon(arr) {
@@ -294,7 +364,10 @@ async function getChannelVideoDetails(channelId) {
     key: YOUTUBE_API_KEY,
   });
 
-  const videoIds = search.data.items.map((v) => v.id.videoId).join(",");
+  const ids = (search.data.items || []).map((v) => v?.id?.videoId).filter(Boolean);
+  if (!ids.length) return [];
+
+  const videoIds = ids.join(",");
   const videos = await youtubeGet("https://www.googleapis.com/youtube/v3/videos", {
     part: "snippet,statistics",
     id: videoIds,
@@ -316,19 +389,23 @@ async function analyzeChannelNiche(videoList) {
     .map((v) => `Title: ${v.title}\nDescription: ${v.description}\nTags: ${v.tags.join(", ")}`)
     .join("\n\n");
 
-  const response = await openai.chat.completions.create({
-    model: "gpt-4o-mini",
-    response_format: { type: "json_object" },
+  const response = await callLLM({
+    json: true,
     messages: [
       { role: "system", content: "You are a YouTube channel strategist. Analyze channel niche deeply." },
       {
         role: "user",
-        content: `Analyze this channel content and return JSON:\n{\n"niche":"","primary_topic":"","common_objects":[],"emotion_baseline":"","style_profile":"","visual_theme":""\n}\n\n${combinedText}`,
+        content: `Analyze this channel content and return JSON:
+{
+"niche":"","primary_topic":"","common_objects":[],"emotion_baseline":"","style_profile":"","visual_theme":""
+}
+
+${combinedText}`,
       },
     ],
   });
 
-  return safeJsonParse(response.choices[0].message.content, {
+  return safeJsonParse(response?.choices?.[0]?.message?.content, {
     niche: "general",
     primary_topic: "general",
     common_objects: [],
@@ -340,21 +417,20 @@ async function analyzeChannelNiche(videoList) {
 
 async function analyzeImageWithVision(imageBuffer) {
   const base64Image = imageBuffer.toString("base64");
-  const response = await openai.chat.completions.create({
-    model: "gpt-4o-mini",
-    response_format: { type: "json_object" },
+  const response = await callLLM({
+    json: true,
     messages: [
       {
         role: "system",
-        content:
-          "You are a YouTube thumbnail CTR expert. Return JSON only. All ratio and bbox coordinates in 0..1.",
+        content: "You are a strict YouTube thumbnail CTR evaluator. Return JSON only. All bbox coordinates must be normalized 0..1. Penalize text overlap on face, low contrast, weak foreground-background separation; reward expressive large faces and clear typography.",
       },
       {
         role: "user",
         content: [
           {
             type: "text",
-            text: "Return fields: visual_ctr_score, face_score, emotion_score, color_score, readability_score, face_ratio, subject_position_x, negative_space_ratio, camera_distance_estimate, horizon_line_estimate, color_saturation_level, contrast_strength, emotion_intensity_avg, background_blur_level, object_density, lighting_style, composition_style, text_position, realism_level, art_style, render_type, subject_distortion_type, color_palette_type, face_bbox, text_bbox, color_stats, avg_rgb, brightness_mean, saturation_mean, ocr_text",
+            text: `Return JSON fields exactly: visual_ctr_score, face_score, emotion_score, color_score, readability_score, face_ratio, subject_position_x, negative_space_ratio, camera_distance_estimate, horizon_line_estimate, color_saturation_level, contrast_strength, emotion_intensity_avg, background_blur_level, object_density, lighting_style, composition_style, text_position, realism_level, art_style, render_type, subject_distortion_type, color_palette_type, face_bbox, text_bbox, color_stats, avg_rgb, brightness_mean, saturation_mean, ocr_text.
+Rules: bbox in 0..1, text-face overlap must reduce score, low contrast reduce score, clear typography and strong subject separation increase score. JSON only.`,
           },
           { type: "image_url", image_url: { url: `data:image/png;base64,${base64Image}` } },
         ],
@@ -362,7 +438,7 @@ async function analyzeImageWithVision(imageBuffer) {
     ],
   });
 
-  const parsed = safeJsonParse(response.choices[0].message.content, null);
+  const parsed = safeJsonParse(response?.choices?.[0]?.message?.content, null);
   if (!parsed) return null;
 
   parsed.face_bbox = normalizeBBox(parsed.face_bbox);
@@ -372,75 +448,102 @@ async function analyzeImageWithVision(imageBuffer) {
   parsed.negative_space_ratio = clamp(Number(parsed.negative_space_ratio || 0), 0, 1);
   parsed.camera_distance_estimate = clamp(Number(parsed.camera_distance_estimate || 0), 0, 1);
   parsed.horizon_line_estimate = clamp(Number(parsed.horizon_line_estimate || 0), 0, 1);
+  parsed.visual_ctr_score = clamp(Number(parsed.visual_ctr_score || 0), 0, 100);
+  parsed.hook_strength = clamp(Number(parsed.hook_strength || 0), 0, 10);
   return parsed;
 }
 
 async function analyzeContent(data, channelDNA) {
-  const response = await openai.chat.completions.create({
-    model: "gpt-4o-mini",
-    response_format: { type: "json_object" },
+  const response = await callLLM({
+    json: true,
     messages: [
       {
         role: "system",
-        content: `You are an elite YouTube CTR strategist. Channel baseline: ${channelDNA?.niche_profile?.niche || "general"}`,
+        content: `You are a senior YouTube CTR engineer. Always return strict JSON only. Optimize for curiosity gap, distinctiveness, and click intent. Channel baseline niche: ${channelDNA?.niche_profile?.niche || "general"}.`,
       },
       {
         role: "user",
-        content: `Analyze video and return JSON with category, template, game, specific_game_elements, visual_objects, environment_type, mood, focus, style, layout, text_hook, hook_strength, emotion_intensity, ctr_score, text_variations.\nTitle:${data.title}\nDescription:${data.description}`,
+        content: `Analyze the video metadata and return strict JSON with exactly these fields:
+{
+  "category": "",
+  "template": "",
+  "focus": "",
+  "mood": "",
+  "psychological_trigger": "",
+  "visual_hook_type": "",
+  "text_hook": "",
+  "hook_strength": 0,
+  "emotion_intensity": 0,
+  "ctr_score": 0,
+  "text_variations": []
+}
+Rules:
+- text_hook must be 2-5 words
+- maximize curiosity gap
+- avoid generic phrases
+- think like CTR engineer
+Title: ${data.title}
+Description: ${data.description}
+Tags: ${(data.tags || []).join(", ")}`,
       },
     ],
   });
-  return safeJsonParse(response.choices[0].message.content, null);
+
+  const parsed = safeJsonParse(response?.choices?.[0]?.message?.content, null);
+  if (!parsed) return null;
+
+  parsed.category = String(parsed.category || "general");
+  parsed.template = String(parsed.template || "story_cards");
+  parsed.focus = String(parsed.focus || data.title || "main subject");
+  parsed.mood = String(parsed.mood || "intense");
+  parsed.psychological_trigger = String(parsed.psychological_trigger || "curiosity");
+  parsed.visual_hook_type = String(parsed.visual_hook_type || "contrast");
+  parsed.text_hook = String(parsed.text_hook || "Must Watch").split(/\s+/).slice(0, 5).join(" ");
+  parsed.hook_strength = clamp(Number(parsed.hook_strength || 5), 0, 10);
+  parsed.emotion_intensity = clamp(Number(parsed.emotion_intensity || 5), 0, 10);
+  parsed.ctr_score = clamp(Number(parsed.ctr_score || 50), 0, 100);
+  if (!Array.isArray(parsed.text_variations) || parsed.text_variations.length === 0) {
+    parsed.text_variations = [parsed.text_hook];
+  }
+  parsed.text_variations = parsed.text_variations.map((t) => String(t).split(/\s+/).slice(0, 5).join(" ")).slice(0, 5);
+
+  return parsed;
 }
 
 function mergeDNA(context, channelDNA) {
   const n = channelDNA?.niche_profile || {};
-  return `Channel Style Baseline:
-Lighting: ${channelDNA?.dominant_lighting_style || "cinematic"}
-Composition: ${channelDNA?.dominant_composition_style || "centered"}
-Art style: ${channelDNA?.dominant_art_style || "photorealistic"}
-Color palette: ${channelDNA?.dominant_color_palette || "vivid"}
-Render type: ${channelDNA?.dominant_render_type || "digital"}
-Niche: ${n.niche || "general"}
-Primary topic: ${n.primary_topic || "general"}
-Realism: ${channelDNA?.avg_realism_level || 50}`;
+  return `Channel Style Baseline:\nLighting: ${channelDNA?.dominant_lighting_style || "cinematic"}\nComposition: ${channelDNA?.dominant_composition_style || "centered"}\nArt style: ${channelDNA?.dominant_art_style || "photorealistic"}\nColor palette: ${channelDNA?.dominant_color_palette || "vivid"}\nRender type: ${channelDNA?.dominant_render_type || "digital"}\nNiche: ${n.niche || "general"}\nPrimary topic: ${n.primary_topic || "general"}\nRealism: ${channelDNA?.avg_realism_level || 50}`;
 }
 
 function buildPrompt(context) {
   const dna = context.dna || {};
-  const textPosition = dna.dominant_text_position || "right";
   const textB = dna.text_bbox_avg || { x: 0.7, y: 0.15, w: 0.25, h: 0.18 };
   const faceB = dna.face_bbox_avg || { x: 0.25, y: 0.2, w: 0.35, h: 0.55 };
-  const zone = highNegativeSpaceZones(dna.negative_space_map || createGrid(0.5), 0.6);
 
-  const typographyRules = [];
-  if ((dna.uppercase_ratio || 0) > 0.7) typographyRules.push("Use ALL CAPS bold text");
-  else typographyRules.push("Use mixed-case readable bold text");
-  if (dna.dominant_text_outline) typographyRules.push("Text must have strong outline stroke");
-  typographyRules.push(`Target text area ratio: ${(dna.text_area_ratio || 0.1).toFixed(2)}`);
-  typographyRules.push(`Text position approx x=${textB.x.toFixed(2)}, y=${textB.y.toFixed(2)}`);
-  typographyRules.push("Text must not overlap face region");
+  const typographyRules = [
+    (dna.uppercase_ratio || 0) > 0.7 ? "Use ALL CAPS bold typography" : "Use mixed-case bold readable typography",
+    dna.dominant_text_outline ? "Text requires strong stroke outline" : "Use subtle text outline",
+    `Text area ratio target: ${(dna.text_area_ratio || 0.1).toFixed(2)}`,
+    `Preferred text bbox: x=${textB.x.toFixed(2)}, y=${textB.y.toFixed(2)}, w=${textB.w.toFixed(2)}, h=${textB.h.toFixed(2)}`,
+    `Face protected bbox: x=${faceB.x.toFixed(2)}, y=${faceB.y.toFixed(2)}, w=${faceB.w.toFixed(2)}, h=${faceB.h.toFixed(2)}`,
+    "Text must NOT overlap face",
+  ];
 
-  const expressionRule = (dna.avg_emotion_score || 0) > 70
-    ? "Highly expressive exaggerated facial emotion"
-    : "Moderate natural facial expression";
+  return `=== CHANNEL DNA BASELINE ===
+${mergeDNA(context, dna)}
 
-  return `${mergeDNA(context, dna)}
------------------------------------
-Scene:
-Main subject: ${context.focus}
-Mood: ${context.mood}
-Subject positioned around X=${(dna.subject_position_x || 0.5).toFixed(2)}
-Camera distance similar to baseline (${(dna.camera_distance_estimate || 0.5).toFixed(2)})
-Maintain composition style: ${dna.dominant_composition_style || "balanced"}
-Place text in high negative space zones (${zone})
-Avoid placing main subject in high density zones
-${expressionRule}
------------------------------------
-Typography:
-${typographyRules.join("\n")}
------------------------------------
-Thumbnail text: "${context.text_hook}"`;
+=== SCENE DESIGN ===
+- One dominant subject only: ${context.focus}
+- Mood: ${context.mood}
+- Background: clean and uncluttered
+- Lighting: high contrast, dramatic expression
+- Composition lock: style=${dna.dominant_composition_style || "balanced"}, subject_x=${(dna.subject_position_x || 0.5).toFixed(2)}, camera_distance=${(dna.camera_distance_estimate || 0.5).toFixed(2)}, horizon=${(dna.horizon_line_estimate || 0.5).toFixed(2)}
+- Visual hook type: ${context.visual_hook_type || "contrast"}
+- Psychological trigger: ${context.psychological_trigger || "curiosity"}
+
+=== TYPOGRAPHY RULES ===
+${typographyRules.map((r) => `- ${r}`).join("\n")}
+- Headline: "${context.text_hook}"`;
 }
 
 function buildNegativePrompt() {
@@ -451,20 +554,23 @@ function clip01(v) {
   return clamp(Number(v || 0), 0, 1);
 }
 
+function boundedBlend(oldV, newV, min, max) {
+  const alpha = 0.15;
+  const blended = Number(oldV || 0) + alpha * (Number(newV || 0) - Number(oldV || 0));
+  return Number(clamp(blended, min, max).toFixed(4));
+}
+
 function updateDNAFromWinner(channelId, winner, channelDNA) {
   if (!channelDNA || !winner) return;
-  const alpha = 0.15;
   const dnaPath = path.join(DNA_DIR, `${channelId}.json`);
 
-  const blend = (oldV, newV) => Number((oldV + alpha * (newV - oldV)).toFixed(4));
-
   channelDNA.sample_size = Math.min(200, (channelDNA.sample_size || 0) + 1);
-  channelDNA.avg_visual_ctr = Math.round(blend(channelDNA.avg_visual_ctr || 50, winner.vision_score || 50));
-  channelDNA.subject_position_x = blend(channelDNA.subject_position_x || 0.5, winner.subject_position_x || channelDNA.subject_position_x || 0.5);
-  channelDNA.emotion_intensity_avg = blend(channelDNA.emotion_intensity_avg || 50, winner.emotion_score || channelDNA.emotion_intensity_avg || 50);
-  channelDNA.color_saturation_level = blend(channelDNA.color_saturation_level || 50, winner.color_score || channelDNA.color_saturation_level || 50);
-  channelDNA.contrast_strength = blend(channelDNA.contrast_strength || 50, winner.readability_score || channelDNA.contrast_strength || 50);
-  channelDNA.negative_space_ratio = blend(channelDNA.negative_space_ratio || 0.5, winner.negative_space_ratio || channelDNA.negative_space_ratio || 0.5);
+  channelDNA.avg_visual_ctr = Math.round(boundedBlend(channelDNA.avg_visual_ctr || 50, winner.vision_score || 50, 1, 100));
+  channelDNA.subject_position_x = boundedBlend(channelDNA.subject_position_x || 0.5, winner.subject_position_x || channelDNA.subject_position_x || 0.5, 0.1, 0.9);
+  channelDNA.emotion_intensity_avg = boundedBlend(channelDNA.emotion_intensity_avg || 50, winner.emotion_score || channelDNA.emotion_intensity_avg || 50, 20, 95);
+  channelDNA.color_saturation_level = boundedBlend(channelDNA.color_saturation_level || 50, winner.color_score || channelDNA.color_saturation_level || 50, 1, 100);
+  channelDNA.contrast_strength = boundedBlend(channelDNA.contrast_strength || 50, winner.readability_score || channelDNA.contrast_strength || 50, 20, 95);
+  channelDNA.negative_space_ratio = boundedBlend(channelDNA.negative_space_ratio || 0.5, winner.negative_space_ratio || channelDNA.negative_space_ratio || 0.5, 0.1, 0.8);
 
   fs.writeFileSync(dnaPath, JSON.stringify(channelDNA, null, 2));
 }
@@ -503,25 +609,6 @@ async function getChannelIdFromVideo(videoId) {
 
 function findNodeByType(workflow, type) {
   return Object.keys(workflow).find((key) => workflow[key].class_type === type);
-}
-
-function resolvePromptNodes(workflow) {
-  const clipNodes = Object.keys(workflow).filter((k) => workflow[k].class_type === "CLIPTextEncode");
-  if (clipNodes.length < 2) return { positiveNode: null, negativeNode: null };
-
-  const looksNegative = (node) => {
-    const title = String(node?._meta?.title || "").toLowerCase();
-    const t = String(node?.inputs?.text || "").toLowerCase();
-    return title.includes("negative")
-      || t.includes("low quality")
-      || t.includes("blurry")
-      || t.includes("low contrast")
-      || t.includes("bad anatomy");
-  };
-
-  const negativeNode = clipNodes.find((k) => looksNegative(workflow[k])) || clipNodes[1];
-  const positiveNode = clipNodes.find((k) => k !== negativeNode) || clipNodes[0];
-  return { positiveNode, negativeNode };
 }
 
 async function waitForComfyImage(promptId, maxAttempts = 45, delayMs = 2000) {
@@ -681,7 +768,7 @@ app.get("/analyze-channel", async (req, res) => {
 
         analyzed.push({ videoId: video.videoId, ...vision });
       } catch (err) {
-        console.log("Skip error:", err.message);
+        log("warn", "thumbnail analysis skipped", { error: err.message });
       }
     }
 
@@ -770,9 +857,9 @@ app.get("/analyze-channel", async (req, res) => {
     }
 
     analyzeCache.set(cacheKey, { ts: Date.now(), data: dna });
-    return res.json({ status: "dna_created", dna });
+    return res.json({ status: "dna_created", dna, system_flow: buildSystemFlowOverview() });
   } catch (err) {
-    console.error(err);
+    log("error", "request failed", { error: err.message });
     return res.json({ error: err.message });
   }
 });
@@ -782,6 +869,8 @@ app.get("/generate-thumbnail", async (req, res) => {
   try {
     const videoId = req.query.video_id;
     const version = req.query.workflow_version || "thumbmagic_core_v1.json";
+    const forceColorAdjust = String(req.query.color_adjust || "0") === "1";
+    const ctrThreshold = Number(process.env.COLOR_ADJUST_CTR_THRESHOLD || 65);
     if (!videoId) return res.json({ error: "video_id is required" });
 
     const baseWorkflow = safeJsonParse(fs.readFileSync(`./workflows/${version}`, "utf-8"), null);
@@ -812,13 +901,14 @@ app.get("/generate-thumbnail", async (req, res) => {
       });
 
       if (DEBUG) {
-        console.log("==== FINAL PROMPT ====");
-        console.log(finalPrompt);
+        log("debug", "final prompt", { prompt: finalPrompt });
       }
 
       const kSamplerNode = findNodeByType(workflow, "KSampler");
-      const { positiveNode, negativeNode } = resolvePromptNodes(workflow);
-      if (!positiveNode || !negativeNode) return res.json({ error: "Workflow must contain 2 CLIPTextEncode nodes (positive + negative)" });
+      const clipNodes = Object.keys(workflow).filter((k) => workflow[k].class_type === "CLIPTextEncode");
+      const positiveNode = clipNodes[0];
+      const negativeNode = clipNodes[1];
+      if (!positiveNode || !negativeNode) return res.json({ error: "Workflow missing CLIPTextEncode nodes" });
 
       workflow[positiveNode].inputs.text = finalPrompt;
       workflow[negativeNode].inputs.text = negativePrompt;
@@ -843,11 +933,13 @@ app.get("/generate-thumbnail", async (req, res) => {
       const imageResponse = await axios.get(imageUrl, { responseType: "arraybuffer" });
       let processedImage = Buffer.from(imageResponse.data);
 
-      if (channelDNA?.avg_color_histogram_256?.rHist?.length === 256) {
-        processedImage = await matchHistogram(processedImage, channelDNA.avg_color_histogram_256);
-      }
-      if (channelDNA?.avg_color_stats?.r) {
-        processedImage = await colorTransfer(processedImage, channelDNA.avg_color_stats, 0.4);
+      const shouldAdjustColor = forceColorAdjust || Number(analysis?.ctr_score || 0) < ctrThreshold;
+      if (shouldAdjustColor) {
+        if (channelDNA?.avg_color_histogram_256?.rHist?.length === 256) {
+          processedImage = await matchHistogram(processedImage, channelDNA.avg_color_histogram_256);
+        } else if (channelDNA?.avg_color_stats?.r) {
+          processedImage = await colorTransfer(processedImage, channelDNA.avg_color_stats, 0.4);
+        }
       }
 
       const visionAnalysis = await analyzeImageWithVision(processedImage);
@@ -870,6 +962,7 @@ app.get("/generate-thumbnail", async (req, res) => {
         readability_score: visionAnalysis.readability_score,
         subject_position_x: clip01(visionAnalysis.subject_position_x),
         negative_space_ratio: clip01(visionAnalysis.negative_space_ratio),
+        color_adjust_applied: shouldAdjustColor ? 1 : 0,
       });
     }
 
@@ -890,15 +983,26 @@ app.get("/generate-thumbnail", async (req, res) => {
       winner,
       thumbnails: variations,
       concurrency_limit: 2,
+      system_flow: buildSystemFlowOverview(),
     });
   } catch (err) {
-    console.error(err);
+    log("error", "request failed", { error: err.message });
     return res.json({ error: err.message });
   } finally {
     comfySemaphore.release();
   }
 });
 
+app.get("/system-flow", (_req, res) => {
+  const modules = buildSystemFlowOverview();
+  return res.json({
+    closed_loop: true,
+    summary: "Channel analysis -> content analysis -> prompt build -> generation -> vision scoring -> winner -> DNA update",
+    modules,
+    flow_sequence: modules.map((m) => m.module),
+  });
+});
+
 app.listen(9000, () => {
-  console.log("Server running on http://localhost:9000");
+  log("info", "server started", { url: "http://localhost:9000" });
 });
