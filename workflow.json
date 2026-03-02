@@ -7,158 +7,81 @@
       "sampler_name": "dpmpp_2m",
       "scheduler": "karras",
       "denoise": 1,
-      "model": [
-        "10",
-        0
-      ],
-      "positive": [
-        "6",
-        0
-      ],
-      "negative": [
-        "7",
-        0
-      ],
-      "latent_image": [
-        "5",
-        0
-      ]
+      "model": ["10", 0],
+      "positive": ["6", 0],
+      "negative": ["7", 0],
+      "latent_image": ["5", 0]
     },
     "class_type": "KSampler",
-    "_meta": {
-      "title": "KSampler"
-    }
+    "_meta": { "title": "KSampler" }
   },
   "4": {
-    "inputs": {
-      "ckpt_name": "juggernautXL_ragnarokBy.safetensors"
-    },
+    "inputs": { "ckpt_name": "juggernautXL_ragnarokBy.safetensors" },
     "class_type": "CheckpointLoaderSimple",
-    "_meta": {
-      "title": "Load Checkpoint"
-    }
+    "_meta": { "title": "Load Checkpoint" }
   },
   "5": {
-    "inputs": {
-      "width": 1280,
-      "height": 720,
-      "batch_size": 1
-    },
+    "inputs": { "width": 1280, "height": 720, "batch_size": 1 },
     "class_type": "EmptyLatentImage",
-    "_meta": {
-      "title": "Empty Latent Image"
-    }
+    "_meta": { "title": "Empty Latent Image" }
   },
   "6": {
     "inputs": {
-      "text": "(pop artstyle:1.2)\nTrendCraft:0.9,\n(neon pop art style:1.0),\n(hyper vibrant lighting:1.3),\n(color pop contrast:1.3),\n(studio flash lighting:1.2),\n(sharp facial highlights:1.2),hyper real but slightly stylized,\nsemi-cartoon texture finish,\nskin slightly smooth but detailed,\nvibrant edge highlights,\nstudio flash lighting,\nstrong color separation,\nhigh clarity thumbnail aesthetic,ultra sharp focus,\ndramatic rim light,\nhigh contrast lighting,\ncinematic thumbnail composition,\nface centered,\nclean background separation",
-      "clip": [
-        "10",
-        1
-      ]
+      "text": "(pop artstyle:1.2), TrendCraft:0.9, (neon pop art style:1.0)",
+      "clip": ["10", 1]
     },
     "class_type": "CLIPTextEncode",
-    "_meta": {
-      "title": "CLIP Text Encode (Prompt)"
-    }
+    "_meta": { "title": "CLIP Text Encode (Positive Prompt)" }
   },
   "7": {
     "inputs": {
-      "text": "flat lighting,\ncinematic dark mood,\nlow contrast,\ndesaturated colors,\nfilm grain,\nmoody shadows,",
-      "clip": [
-        "4",
-        1
-      ]
+      "text": "flat lighting, low contrast, blurry, bad anatomy",
+      "clip": ["10", 1]
     },
     "class_type": "CLIPTextEncode",
-    "_meta": {
-      "title": "CLIP Text Encode (Prompt)"
-    }
+    "_meta": { "title": "CLIP Text Encode (Negative Prompt)" }
   },
   "8": {
-    "inputs": {
-      "samples": [
-        "3",
-        0
-      ],
-      "vae": [
-        "4",
-        2
-      ]
-    },
+    "inputs": { "samples": ["3", 0], "vae": ["4", 2] },
     "class_type": "VAEDecode",
-    "_meta": {
-      "title": "VAE Decode"
-    }
+    "_meta": { "title": "VAE Decode" }
   },
   "9": {
-    "inputs": {
-      "filename_prefix": "ComfyUI",
-      "images": [
-        "8",
-        0
-      ]
-    },
+    "inputs": { "filename_prefix": "ComfyUI", "images": ["8", 0] },
     "class_type": "SaveImage",
-    "_meta": {
-      "title": "Save Image"
-    }
+    "_meta": { "title": "Save Image" }
   },
   "10": {
     "inputs": {
       "lora_name": "TrendCraft_The_Peoples_Style_Detailer-v2.3I-4_15_2025-SDXL.safetensors",
       "strength_model": 0.4,
       "strength_clip": 0.3,
-      "model": [
-        "11",
-        0
-      ],
-      "clip": [
-        "11",
-        1
-      ]
+      "model": ["11", 0],
+      "clip": ["11", 1]
     },
     "class_type": "LoraLoader",
-    "_meta": {
-      "title": "Load LoRA"
-    }
+    "_meta": { "title": "Load LoRA" }
   },
   "11": {
     "inputs": {
       "lora_name": "Popp-Artstyle-v0.1.safetensors",
       "strength_model": 0.6,
       "strength_clip": 0.6,
-      "model": [
-        "12",
-        0
-      ],
-      "clip": [
-        "12",
-        1
-      ]
+      "model": ["12", 0],
+      "clip": ["12", 1]
     },
     "class_type": "LoraLoader",
-    "_meta": {
-      "title": "Load LoRA"
-    }
+    "_meta": { "title": "Load LoRA" }
   },
   "12": {
     "inputs": {
       "lora_name": "Neon Pop Art Style v2.safetensors",
       "strength_model": 0.4,
       "strength_clip": 0.4,
-      "model": [
-        "4",
-        0
-      ],
-      "clip": [
-        "4",
-        1
-      ]
+      "model": ["4", 0],
+      "clip": ["4", 1]
     },
     "class_type": "LoraLoader",
-    "_meta": {
-      "title": "Load LoRA"
-    }
+    "_meta": { "title": "Load LoRA" }
   }
 }
