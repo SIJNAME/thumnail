@@ -140,3 +140,41 @@ node --check coloranalysis.js
 หมายเหตุ:
 - ระบบ backend จะเติม prompt จริงโดยอัตโนมัติ (เขียนทับ `inputs.text` ของ CLIP node)
 - ฝั่ง server รองรับการหา positive/negative node จาก `class_type` และมีการเขียนทับ prompt ตอน runtime
+
+## Production SaaS Architecture (v2)
+
+โครงสร้างใหม่:
+
+```txt
+src/
+  config/
+  routes/
+  controllers/
+  services/
+  workers/
+  utils/
+  middleware/
+  queue/
+  types/
+```
+
+### Run (Production-style)
+
+```bash
+cp .env.example .env
+npm install
+npm run build
+npm start
+```
+
+### Run Worker
+
+```bash
+npm run worker
+```
+
+### Docker
+
+```bash
+docker compose up --build
+```
