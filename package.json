@@ -1,21 +1,19 @@
 {
-  "name": "thumbnail-api",
+  "name": "arproject-thumbnail-dna",
   "version": "1.0.0",
-  "description": "",
+  "description": "YouTube thumbnail Channel DNA analyzer and generator API",
   "main": "server.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "start": "node server.js"
+    "start": "node server.js",
+    "check": "node --check server.js && node --check coloranalysis.js"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "type": "commonjs",
   "dependencies": {
-    "axios": "^1.13.5",
-    "dotenv": "^17.3.1",
-    "express": "^5.2.1",
-    "openai": "^6.22.0",
-    "sharp": "^0.34.5"
+    "axios": "^1.7.7",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.0",
+    "openai": "^4.64.0",
+    "sharp": "^0.33.5",
+    "@xenova/transformers": "^2.17.2",
+    "tesseract.js": "^5.1.0"
   }
 }

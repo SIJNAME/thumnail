@@ -9,37 +9,91 @@ if (!process.env.YOUTUBE_API_KEY) {
   console.error("Missing YOUTUBE_API_KEY");
   process.exit(1);
 }
+
 const sharp = require("sharp");
 const express = require("express");
 const axios = require("axios");
-
 const fs = require("fs");
+const path = require("path");
 const OpenAI = require("openai");
 const { matchHistogram, getHistogram } = require("./coloranalysis");
 
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
-
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: "20mb" }));
 
-const COMFY_URL = "http://127.0.0.1:8188";
+const COMFY_URL = process.env.COMFY_URL || "http://127.0.0.1:8188";
 const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY;
-const path = require("path");
 const DNA_DIR = path.join(__dirname, "channel_dna");
+const TEMP_DIR = path.join(__dirname, "temp");
+const DEBUG = process.env.DEBUG_PROMPT === "1";
+const GRID_W = 64;
+const GRID_H = 36;
 
-if (!fs.existsSync(DNA_DIR)) {
-  fs.mkdirSync(DNA_DIR);
+if (!fs.existsSync(DNA_DIR)) fs.mkdirSync(DNA_DIR);
+if (!fs.existsSync(TEMP_DIR)) fs.mkdirSync(TEMP_DIR);
+
+const analyzeCache = new Map();
+const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+
+class Semaphore {
+  constructor(max) {
+    this.max = max;
+    this.current = 0;
+    this.waiters = [];
+  }
+  async acquire() {
+    if (this.current < this.max) {
+      this.current += 1;
+      return;
+    }
+    await new Promise((resolve) => this.waiters.push(resolve));
+    this.current += 1;
+  }
+  release() {
+    this.current = Math.max(0, this.current - 1);
+    const next = this.waiters.shift();
+    if (next) next();
+  }
 }
-async function getMeanStd(imageBuffer) {
-  const { data, info } = await sharp(imageBuffer)
-    .raw()
-    .toBuffer({ resolveWithObject: true });
 
+const comfySemaphore = new Semaphore(2);
+
+function clamp(v, lo, hi) {
+  return Math.max(lo, Math.min(hi, v));
+}
+
+function safeJsonParse(raw, fallback = null) {
+  try {
+    return JSON.parse(raw);
+  } catch (_err) {
+    return fallback;
+  }
+}
+
+function quotaAwareError(err) {
+  const status = err?.response?.status;
+  const reason = err?.response?.data?.error?.errors?.[0]?.reason;
+  if (status === 403 && ["quotaExceeded", "dailyLimitExceeded", "rateLimitExceeded"].includes(reason)) {
+    return `YouTube quota exceeded (${reason})`;
+  }
+  return null;
+}
+
+async function youtubeGet(url, params) {
+  try {
+    return await axios.get(url, { params });
+  } catch (err) {
+    const msg = quotaAwareError(err);
+    if (msg) throw new Error(msg);
+    throw err;
+  }
+}
+
+async function getMeanStd(imageBuffer) {
+  const { data, info } = await sharp(imageBuffer).removeAlpha().raw().toBuffer({ resolveWithObject: true });
   const channels = info.channels;
   const pixels = info.width * info.height;
-
   const stats = {
     r: { sum: 0, sqSum: 0 },
     g: { sum: 0, sqSum: 0 },
@@ -50,11 +104,9 @@ async function getMeanStd(imageBuffer) {
     const r = data[i];
     const g = data[i + 1];
     const b = data[i + 2];
-
     stats.r.sum += r;
     stats.g.sum += g;
     stats.b.sum += b;
-
     stats.r.sqSum += r * r;
     stats.g.sqSum += g * g;
     stats.b.sqSum += b * b;
@@ -66,1530 +118,365 @@ async function getMeanStd(imageBuffer) {
     return { mean, std: Math.sqrt(Math.max(variance, 1)) };
   };
 
-  return {
-    r: calc(stats.r),
-    g: calc(stats.g),
-    b: calc(stats.b),
-  };
+  return { r: calc(stats.r), g: calc(stats.g), b: calc(stats.b) };
 }
 
 async function colorTransfer(imageBuffer, targetStats, weight = 0.4) {
-
   const source = await getMeanStd(imageBuffer);
-
   const safe = (v) => (v === 0 ? 1 : v);
-
-  const scaleR = 1 + weight * ((targetStats.r.std / safe(source.r.std)) - 1);
-  const scaleG = 1 + weight * ((targetStats.g.std / safe(source.g.std)) - 1);
-  const scaleB = 1 + weight * ((targetStats.b.std / safe(source.b.std)) - 1);
-
+  const scaleR = 1 + weight * (targetStats.r.std / safe(source.r.std) - 1);
+  const scaleG = 1 + weight * (targetStats.g.std / safe(source.g.std) - 1);
+  const scaleB = 1 + weight * (targetStats.b.std / safe(source.b.std) - 1);
   const shiftR = weight * (targetStats.r.mean - source.r.mean);
   const shiftG = weight * (targetStats.g.mean - source.g.mean);
   const shiftB = weight * (targetStats.b.mean - source.b.mean);
+  return sharp(imageBuffer).linear([scaleR, scaleG, scaleB], [shiftR, shiftG, shiftB]).toBuffer();
+}
 
-  return sharp(imageBuffer)
-    .linear(
-      [scaleR, scaleG, scaleB],
-      [shiftR, shiftG, shiftB]
-    )
-    .toBuffer();
-}
-/* =========================
-   📁 Ensure temp folder exists
-========================= */
-const TEMP_DIR = path.join(__dirname, "temp");
-if (!fs.existsSync(TEMP_DIR)) {
-  fs.mkdirSync(TEMP_DIR);
-}
-/* =========================
-   🔥 LOAD CHANNEL DNA
-========================= */
 function mostCommon(arr) {
-  if (!arr || arr.length === 0) return null;
-
+  if (!arr?.length) return null;
   const counts = {};
-
-  arr.forEach(item => {
+  arr.forEach((item) => {
     if (!item) return;
     counts[item] = (counts[item] || 0) + 1;
   });
+  return Object.entries(counts).sort((a, b) => b[1] - a[1])[0]?.[0] || null;
+}
 
-  let max = 0;
-  let result = null;
+function loadChannelDNA(channelId) {
+  const dnaPath = path.join(DNA_DIR, `${channelId}.json`);
+  if (!fs.existsSync(dnaPath)) return null;
+  return safeJsonParse(fs.readFileSync(dnaPath, "utf-8"), null);
+}
 
-  for (let key in counts) {
-    if (counts[key] > max) {
-      max = counts[key];
-      result = key;
+function ensureMatrix(map, h = GRID_H, w = GRID_W) {
+  if (!Array.isArray(map) || map.length !== h) return null;
+  for (const row of map) {
+    if (!Array.isArray(row) || row.length !== w) return null;
+    for (const v of row) if (typeof v !== "number") return null;
+  }
+  return map;
+}
+
+function validateDnaSchema(dna) {
+  if (!dna || typeof dna !== "object") return false;
+  const requiredNums = ["sample_size", "avg_visual_ctr", "subject_position_x", "emotion_intensity_avg", "contrast_strength"];
+  if (!requiredNums.every((k) => typeof dna[k] === "number")) return false;
+  if (!dna.avg_color_histogram_256?.rHist || dna.avg_color_histogram_256.rHist.length !== 256) return false;
+  if (!ensureMatrix(dna.subject_density_map) || !ensureMatrix(dna.negative_space_map)) return false;
+  return true;
+}
+
+function saveChannelDNA(channelId, dna) {
+  if (!validateDnaSchema(dna)) throw new Error("DNA schema validation failed");
+  const dnaPath = path.join(DNA_DIR, `${channelId}.json`);
+  fs.writeFileSync(dnaPath, JSON.stringify(dna, null, 2));
+}
+
+function toGridIndex(xNorm, yNorm, wNorm, hNorm) {
+  const x1 = clamp(Math.floor(xNorm * GRID_W), 0, GRID_W - 1);
+  const y1 = clamp(Math.floor(yNorm * GRID_H), 0, GRID_H - 1);
+  const x2 = clamp(Math.ceil((xNorm + wNorm) * GRID_W), x1 + 1, GRID_W);
+  const y2 = clamp(Math.ceil((yNorm + hNorm) * GRID_H), y1 + 1, GRID_H);
+  return { x1, y1, x2, y2 };
+}
+
+function createGrid(fill = 0) {
+  return Array.from({ length: GRID_H }, () => Array(GRID_W).fill(fill));
+}
+
+function addBoxToGrid(grid, bbox, value = 1) {
+  if (!bbox) return;
+  const { x1, y1, x2, y2 } = toGridIndex(bbox.x || 0, bbox.y || 0, bbox.w || 0, bbox.h || 0);
+  for (let y = y1; y < y2; y += 1) {
+    for (let x = x1; x < x2; x += 1) grid[y][x] += value;
+  }
+}
+
+function normalizeGrid(grid, divisor) {
+  return grid.map((row) => row.map((v) => Number((v / Math.max(1, divisor)).toFixed(4))));
+}
+
+function highNegativeSpaceZones(negativeSpaceMap, threshold = 0.6) {
+  const zones = [];
+  for (let y = 0; y < GRID_H; y += 1) {
+    for (let x = 0; x < GRID_W; x += 1) {
+      if ((negativeSpaceMap[y]?.[x] || 0) > threshold) zones.push({ x, y });
+    }
+  }
+  if (!zones.length) return "center";
+  const avgX = zones.reduce((s, z) => s + z.x, 0) / zones.length;
+  if (avgX < GRID_W / 3) return "left";
+  if (avgX > (2 * GRID_W) / 3) return "right";
+  return "center";
+}
+
+function bboxOverlapRatio(a, b) {
+  if (!a || !b) return 0;
+  const ax2 = a.x + a.w;
+  const ay2 = a.y + a.h;
+  const bx2 = b.x + b.w;
+  const by2 = b.y + b.h;
+  const ix1 = Math.max(a.x, b.x);
+  const iy1 = Math.max(a.y, b.y);
+  const ix2 = Math.min(ax2, bx2);
+  const iy2 = Math.min(ay2, by2);
+  const iw = Math.max(0, ix2 - ix1);
+  const ih = Math.max(0, iy2 - iy1);
+  const inter = iw * ih;
+  const textArea = Math.max(1e-6, b.w * b.h);
+  return inter / textArea;
+}
+
+async function createControlNetMaskFromDensityMap(subjectDensityMap, outPath) {
+  const raw = Buffer.alloc(GRID_W * GRID_H);
+  for (let y = 0; y < GRID_H; y += 1) {
+    for (let x = 0; x < GRID_W; x += 1) {
+      const v = subjectDensityMap[y]?.[x] || 0;
+      raw[y * GRID_W + x] = v > 0.5 ? 255 : 0;
     }
   }
 
-  return result;
+  await sharp(raw, { raw: { width: GRID_W, height: GRID_H, channels: 1 } })
+    .resize(1024, 576, { kernel: "nearest" })
+    .png()
+    .toFile(outPath);
+  return outPath;
 }
-function loadChannelDNA(channelId) {
-  const dnaPath = path.join(__dirname, "channel_dna", `${channelId}.json`);
 
-  if (!fs.existsSync(dnaPath)) {
-    return null;
-  }
-
-  const raw = fs.readFileSync(dnaPath, "utf-8");
-  return JSON.parse(raw);
+function normalizeBBox(b) {
+  const fix = (v) => {
+    if (typeof v !== "number" || Number.isNaN(v)) return 0;
+    let x = v > 1.5 ? v / 100 : v;
+    x = clamp(x, 0, 1);
+    return Number(x.toFixed(3));
+  };
+  return { x: fix(b?.x), y: fix(b?.y), w: fix(b?.w), h: fix(b?.h) };
 }
-function updateDNAFromWinner(channelId, winner, channelDNA) {
 
-  if (!channelDNA || !winner) return;
-
-  const dnaPath = path.join(DNA_DIR, `${channelId}.json`);
-
-  // 1️⃣ Update avg_visual_ctr
-  const newCTR = Math.round(
-    (channelDNA.avg_visual_ctr * channelDNA.sample_size + winner.vision_score)
-    / (channelDNA.sample_size + 1)
-  );
-
-  channelDNA.avg_visual_ctr = newCTR;
-  channelDNA.sample_size += 1;
-
-  // 2️⃣ Boost readability if winner strong
-  if (winner.readability_score > channelDNA.avg_readability_score) {
-    channelDNA.avg_readability_score =
-      Math.round((channelDNA.avg_readability_score + winner.readability_score) / 2);
-  }
-
-  // 3️⃣ Boost emotion weight
-  if (winner.emotion_score > channelDNA.avg_emotion_score) {
-    channelDNA.avg_emotion_score =
-      Math.round((channelDNA.avg_emotion_score + winner.emotion_score) / 2);
-  }
-
-  // 4️⃣ Save back to file
-  fs.writeFileSync(dnaPath, JSON.stringify(channelDNA, null, 2));
-
-  console.log("🔥 DNA updated from winner");
+function inferTypographyStats(vision) {
+  const txt = String(vision?.ocr_text || "");
+  const letters = txt.match(/[A-Za-z]/g) || [];
+  const uppers = txt.match(/[A-Z]/g) || [];
+  const words = txt.match(/[A-Za-z0-9]+/g) || [];
+  return {
+    uppercase_ratio: letters.length ? uppers.length / letters.length : 0,
+    dominant_text_outline: (vision?.readability_score || 0) > 70 ? 1 : 0,
+    dominant_font_weight: (vision?.readability_score || 0) > 75 ? "bold" : (vision?.readability_score || 0) > 50 ? "medium" : "light",
+    text_area_ratio: Math.max(0, (vision?.text_bbox?.w || 0) * (vision?.text_bbox?.h || 0)),
+    avg_word_count: words.length,
+  };
 }
-/* =========================
-   🔥 STEP 1 — GET CHANNEL VIDEOS
-========================= */
 
 async function getChannelVideos(channelId) {
-  const response = await axios.get(
-    "https://www.googleapis.com/youtube/v3/search",
-    {
-      params: {
-        part: "snippet",
-        channelId: channelId,
-        maxResults: 20,
-        order: "date",
-        type: "video",
-        key: YOUTUBE_API_KEY,
-      },
-    }
-  );
+  const response = await youtubeGet("https://www.googleapis.com/youtube/v3/search", {
+    part: "snippet",
+    channelId,
+    maxResults: 20,
+    order: "date",
+    type: "video",
+    key: YOUTUBE_API_KEY,
+  });
 
-  return response.data.items.map(item => ({
+  return response.data.items.map((item) => ({
     videoId: item.id.videoId,
-    thumbnail: item.snippet.thumbnails.high.url
+    thumbnail: item.snippet.thumbnails.high?.url || item.snippet.thumbnails.default?.url,
   }));
 }
 
-/* =========================
-   🔥 GET VIDEO DETAILS (for GPT niche analysis)
-========================= */
-
 async function getChannelVideoDetails(channelId) {
+  const search = await youtubeGet("https://www.googleapis.com/youtube/v3/search", {
+    part: "snippet",
+    channelId,
+    maxResults: 15,
+    order: "date",
+    type: "video",
+    key: YOUTUBE_API_KEY,
+  });
 
-  const search = await axios.get(
-    "https://www.googleapis.com/youtube/v3/search",
-    {
-      params: {
-        part: "snippet",
-        channelId,
-        maxResults: 15,
-        order: "date",
-        type: "video",
-        key: YOUTUBE_API_KEY
-      }
-    }
-  );
+  const videoIds = search.data.items.map((v) => v.id.videoId).join(",");
+  const videos = await youtubeGet("https://www.googleapis.com/youtube/v3/videos", {
+    part: "snippet,statistics",
+    id: videoIds,
+    key: YOUTUBE_API_KEY,
+  });
 
-  const videoIds = search.data.items.map(v => v.id.videoId).join(",");
-
-  const videos = await axios.get(
-    "https://www.googleapis.com/youtube/v3/videos",
-    {
-      params: {
-        part: "snippet,statistics",
-        id: videoIds,
-        key: YOUTUBE_API_KEY
-      }
-    }
-  );
-
-  return videos.data.items.map(v => ({
+  return videos.data.items.map((v) => ({
     title: v.snippet.title,
     description: v.snippet.description,
     tags: v.snippet.tags || [],
     categoryId: v.snippet.categoryId,
     viewCount: v.statistics.viewCount,
-    likeCount: v.statistics.likeCount
+    likeCount: v.statistics.likeCount,
   }));
 }
 
-/* =========================
-   🔥 ANALYZE NICHE WITH GPT
-========================= */
-
 async function analyzeChannelNiche(videoList) {
+  const combinedText = videoList
+    .map((v) => `Title: ${v.title}\nDescription: ${v.description}\nTags: ${v.tags.join(", ")}`)
+    .join("\n\n");
 
-  const combinedText = videoList.map(v =>
-    `Title: ${v.title}\nDescription: ${v.description}\nTags: ${v.tags.join(", ")}`
-  ).join("\n\n");
+  const response = await openai.chat.completions.create({
+    model: "gpt-4o-mini",
+    response_format: { type: "json_object" },
+    messages: [
+      { role: "system", content: "You are a YouTube channel strategist. Analyze channel niche deeply." },
+      {
+        role: "user",
+        content: `Analyze this channel content and return JSON:\n{\n"niche":"","primary_topic":"","common_objects":[],"emotion_baseline":"","style_profile":"","visual_theme":""\n}\n\n${combinedText}`,
+      },
+    ],
+  });
 
+  return safeJsonParse(response.choices[0].message.content, {
+    niche: "general",
+    primary_topic: "general",
+    common_objects: [],
+    emotion_baseline: "neutral",
+    style_profile: "general",
+    visual_theme: "general",
+  });
+}
+
+async function analyzeImageWithVision(imageBuffer) {
+  const base64Image = imageBuffer.toString("base64");
   const response = await openai.chat.completions.create({
     model: "gpt-4o-mini",
     response_format: { type: "json_object" },
     messages: [
       {
         role: "system",
-        content: "You are a YouTube channel strategist. Analyze channel niche deeply."
+        content:
+          "You are a YouTube thumbnail CTR expert. Return JSON only. All ratio and bbox coordinates in 0..1.",
       },
-      {
-        role: "user",
-        content: `
-Analyze this channel content and return JSON:
-
-{
-  "niche": "",
-  "primary_topic": "",
-  "common_objects": [],
-  "emotion_baseline": "",
-  "style_profile": "",
-  "visual_theme": ""
-}
-
-Channel Data:
-${combinedText}
-`
-      }
-    ]
-  });
-
-  return JSON.parse(response.choices[0].message.content);
-}
- 
-
-
-/* =========================
-   🔥 ANALYZE CHANNEL API
-========================= */
-/* =========================
-   🧬 ANALYZE CHANNEL → BUILD DNA
-========================= */
-app.get("/analyze-channel", async (req, res) => {
-  try {
-    const channelId = req.query.channel_id;
-
-    if (!channelId) {
-      return res.json({ error: "channel_id is required" });
-    }
-  // 1️⃣ ดึง metadata
-    const videoDetails = await getChannelVideoDetails(channelId);
-
-    // 2️⃣ วิเคราะห์ niche ด้วย GPT
-    const nicheProfile = await analyzeChannelNiche(videoDetails);
-
-    const videos = await getChannelVideos(channelId);
-
-    if (!videos.length) {
-      return res.json({ error: "No videos found" });
-    }
-const channelDNA = loadChannelDNA(channelId);
-
-let rStdTotal = 0;
-let gStdTotal = 0;
-let bStdTotal = 0;
-
-    let total = 0;
-    let faceTotal = 0;
-    let emotionTotal = 0;
-    let colorTotal = 0;
-    let readabilityTotal = 0;
-    
-    let lightingStyles = [];
-    let compositionStyles = [];
-    let textPositions = [];
-    let realismTotal = 0;
-let faceRatioTotal = 0;
-let subjectPosTotal = 0;
-let saturationTotal = 0;
-let contrastTotal = 0;
-let emotionIntensityTotal = 0;
-let blurTotal = 0;
-let objectDensityTotal = 0;
-let brightnessTotal = 0;
-let saturationMeanTotal = 0;
-
-let avgRGBTotal = [0, 0, 0];
-let histogramTotal = [];
-// 🔥 REAL 256-bin histogram accumulate
-let sumR = new Array(256).fill(0);
-let sumG = new Array(256).fill(0);
-let sumB = new Array(256).fill(0);
-let histogramCount = 0;
-let contrastCurveTotal = [];
-let negativeSpaceTotal = 0;
-let horizonTotal = 0;
-let cameraDistanceTotal = 0;
-
-// 🔥 BBOX AGGREGATION (Phase 1 complete)
-let faceBBoxTotal = { x: 0, y: 0, w: 0, h: 0 };
-let textBBoxTotal = { x: 0, y: 0, w: 0, h: 0 };
-    let artStyles = [];
-
-let renderTypes = [];
-let distortionTypes = [];
-let colorPalettes = [];
-
-    const analyzed = [];
-
-    for (let video of videos) {
-      try {
-       const imageUrl = video.thumbnail;
-
-const imageResponse = await axios.get(imageUrl, {
-  responseType: "arraybuffer"
-});
-
-const imageBuffer = Buffer.from(imageResponse.data);
-// 🔥 REAL histogram from pixels (NOT GPT)
-const realHist = await getHistogram(imageBuffer);
-
-for (let i = 0; i < 256; i++) {
-  sumR[i] += realHist.rHist[i];
-  sumG[i] += realHist.gHist[i];
-  sumB[i] += realHist.bHist[i];
-}
-
-histogramCount++;
-
-let processedImage = imageBuffer;
-
-if (channelDNA && channelDNA.sample_size > 5) {
-  processedImage = await colorTransfer(
-    processedImage,
-    channelDNA.avg_color_stats
-  );
-}
-        const vision = await analyzeImageWithVision(processedImage);
-if (!vision) continue;
-
-if (vision.color_stats) {
-  rStdTotal += vision.color_stats.r.std;
-  gStdTotal += vision.color_stats.g.std;
-  bStdTotal += vision.color_stats.b.std;
-}
-// 🔥 accumulate face bbox
-if (vision.face_bbox) {
-  faceBBoxTotal.x += vision.face_bbox.x;
-  faceBBoxTotal.y += vision.face_bbox.y;
-  faceBBoxTotal.w += vision.face_bbox.w;
-  faceBBoxTotal.h += vision.face_bbox.h;
-}
-
-// 🔥 accumulate text bbox
-if (vision.text_bbox) {
-  textBBoxTotal.x += vision.text_bbox.x;
-  textBBoxTotal.y += vision.text_bbox.y;
-  textBBoxTotal.w += vision.text_bbox.w;
-  textBBoxTotal.h += vision.text_bbox.h;
-}
-        lightingStyles.push(vision.lighting_style);
-compositionStyles.push(vision.composition_style);
-textPositions.push(vision.text_position);
-realismTotal += vision.realism_level;
-artStyles.push(vision.art_style);
-renderTypes.push(vision.render_type);
-distortionTypes.push(vision.subject_distortion_type);
-colorPalettes.push(vision.color_palette_type);
-       total += vision.visual_ctr_score;
-        faceTotal += vision.face_score;
-        emotionTotal += vision.emotion_score;
-        colorTotal += vision.color_score;
-        readabilityTotal += vision.readability_score;
-faceRatioTotal += vision.face_ratio || 0;
-subjectPosTotal += vision.subject_position_x || 0;
-saturationTotal += vision.color_saturation_level || 0;
-contrastTotal += vision.contrast_strength || 0;
-emotionIntensityTotal += vision.emotion_intensity_avg || 0;
-blurTotal += vision.background_blur_level || 0;
-objectDensityTotal += vision.object_density || 0;
-brightnessTotal += vision.brightness_mean || 0;
-saturationMeanTotal += vision.saturation_mean || 0;
-
-if (vision.color_histogram && vision.color_histogram.length) {
-  histogramTotal.push(vision.color_histogram);
-}
-
-if (vision.contrast_curve && vision.contrast_curve.length) {
-  contrastCurveTotal.push(vision.contrast_curve);
-}
-
-if (vision.avg_rgb) {
-  avgRGBTotal[0] += vision.avg_rgb[0];
-  avgRGBTotal[1] += vision.avg_rgb[1];
-  avgRGBTotal[2] += vision.avg_rgb[2];
-}
-negativeSpaceTotal += vision.negative_space_ratio || 0;
-horizonTotal += vision.horizon_line_estimate || 0;
-cameraDistanceTotal += vision.camera_distance_estimate || 0;
-        analyzed.push({
-          videoId: video.videoId,
-          ...vision
-        });
-
-        console.log("Analyzed:", video.videoId);
-
-      } catch (err) {
-        console.log("Skip error:", err.message);
-      }
-    }
-
-    const count = analyzed.length;
-    // =============================
-// 🔥 NORMALIZE HISTOGRAM
-// =============================
-// =============================
-// 🔥 NORMALIZE HISTOGRAM
-// =============================
-let normalizedHistogram = [];
-
-if (histogramTotal.length) {
-
-  // 🔥 หา length ที่สั้นที่สุด
-  const minLength = Math.min(
-    ...histogramTotal.map(h => h.length)
-  );
-
-  // 🔥 ตัดทุก histogram ให้เท่ากันก่อน
-  const trimmed = histogramTotal.map(h =>
-    h.slice(0, minLength)
-  );
-
-  const avgHistogram = trimmed[0].map((_, i) =>
-    trimmed.reduce((sum, arr) => sum + (arr[i] || 0), 0) /
-    trimmed.length
-  );
-
-  const sumHist = avgHistogram.reduce((a, b) => a + b, 0);
-
-  if (sumHist > 0) {
-    normalizedHistogram = avgHistogram.map(v =>
-      Number((v / sumHist).toFixed(4))
-    );
-  }
-}
-
-// =============================
-// 🔥 NORMALIZE CONTRAST CURVE
-// =============================
-let normalizedContrast = [];
-
-if (contrastCurveTotal.length) {
-
-  const avgContrast = contrastCurveTotal[0].map((_, i) =>
-    contrastCurveTotal.reduce((sum, arr) => sum + (arr[i] || 0), 0) /
-    contrastCurveTotal.length
-  );
-
-  const sumContrast = avgContrast.reduce((a, b) => a + b, 0);
-
-  normalizedContrast = avgContrast.map(v =>
-    Number((v / sumContrast).toFixed(4))
-  );
-}
-
-    if (!count) {
-      return res.json({ error: "No thumbnails analyzed" });
-    }
-// 🔥 Normalize REAL histogram
-// 🔥 NORMALIZE REAL 256 HISTOGRAM (ALWAYS SAFE)
-let normalizedHist256 = {
-  rHist: new Array(256).fill(1 / 256),
-  gHist: new Array(256).fill(1 / 256),
-  bHist: new Array(256).fill(1 / 256),
-};
-
-if (histogramCount > 0) {
-
-  const avgR = sumR.map(v => v / histogramCount);
-  const avgG = sumG.map(v => v / histogramCount);
-  const avgB = sumB.map(v => v / histogramCount);
-
-  const normalize = (arr) => {
-    const sum = arr.reduce((a, b) => a + b, 0);
-    if (sum === 0) return new Array(256).fill(1 / 256);
-    return arr.map(v => v / sum);
-  };
-
-  normalizedHist256 = {
-    rHist: normalize(avgR),
-    gHist: normalize(avgG),
-    bHist: normalize(avgB),
-  };
-}
-    const dna = {
-      
-      avg_color_histogram_256: {
-  rHist: normalizedHist256.rHist,
-  gHist: normalizedHist256.gHist,
-  bHist: normalizedHist256.bHist
-}
-,
-      face_bbox_avg: {
-  x: Number((faceBBoxTotal.x / count).toFixed(2)),
-  y: Number((faceBBoxTotal.y / count).toFixed(2)),
-  w: Number((faceBBoxTotal.w / count).toFixed(2)),
-  h: Number((faceBBoxTotal.h / count).toFixed(2)),
-},
-
-text_bbox_avg: {
-  x: Number((textBBoxTotal.x / count).toFixed(2)),
-  y: Number((textBBoxTotal.y / count).toFixed(2)),
-  w: Number((textBBoxTotal.w / count).toFixed(2)),
-  h: Number((textBBoxTotal.h / count).toFixed(2)),
-},
-
-avg_color_histogram: normalizedHistogram,
-avg_contrast_curve: normalizedContrast,
-
-      // 🧬 VECTOR STYLE FINGERPRINT
-face_ratio: Number((faceRatioTotal / count).toFixed(2)),
-subject_position_x: Number((subjectPosTotal / count).toFixed(2)),
-color_saturation_level: Number((saturationTotal / count).toFixed(2)),
-contrast_strength: Number((contrastTotal / count).toFixed(2)),
-emotion_intensity_avg: Number((emotionIntensityTotal / count).toFixed(2)),
-background_blur_level: Number((blurTotal / count).toFixed(2)),
-object_density: Number((objectDensityTotal / count).toFixed(2)),
-avg_rgb: [
-  Math.round(avgRGBTotal[0] / count),
-  Math.round(avgRGBTotal[1] / count),
-  Math.round(avgRGBTotal[2] / count),
-],
-
-
-
-brightness_mean: Number((brightnessTotal / count).toFixed(2)),
-saturation_mean: Number((saturationMeanTotal / count).toFixed(2)),
-negative_space_ratio: Number((negativeSpaceTotal / count).toFixed(2)),
-horizon_line_estimate: Number((horizonTotal / count).toFixed(2)),
-camera_distance_estimate: Number((cameraDistanceTotal / count).toFixed(2)),
-      dominant_art_style: mostCommon(artStyles),
-dominant_render_type: mostCommon(renderTypes),
-dominant_distortion: mostCommon(distortionTypes),
-dominant_color_palette: mostCommon(colorPalettes),
-  dominant_color_histogram: normalizedHistogram,
-dominant_contrast_curve: normalizedContrast,
-  channel_id: channelId,
-  niche_profile: nicheProfile,
-  sample_size: count,
-  avg_visual_ctr: Math.round(total / count),
-  avg_face_score: Math.round(faceTotal / count),
-  avg_emotion_score: Math.round(emotionTotal / count),
-  avg_color_score: Math.round(colorTotal / count),
-  avg_readability_score: Math.round(readabilityTotal / count),
-  analyzed_at: new Date().toISOString(),
-
-  dominant_lighting_style: mostCommon(lightingStyles),
-  dominant_composition_style: mostCommon(compositionStyles),
-  dominant_text_position: mostCommon(textPositions),
-  avg_realism_level: Math.round(realismTotal / count)
-};
-
-    const dnaPath = path.join(__dirname, "channel_dna", `${channelId}.json`);
-    fs.writeFileSync(dnaPath, JSON.stringify(dna, null, 2));
-
-    res.json({
-      status: "dna_created",
-      dna
-    });
-
-    } catch (err) {
-    console.error(err);
-    res.json({ error: err.message });
-  }
-});
-/* =========================
-   🔥 GPT ANALYSIS
-========================= */
-async function analyzeImageWithVision(imageBuffer) {
-  const base64Image = imageBuffer.toString("base64");
-
-  const response = await openai.chat.completions.create({
-    model: "gpt-4o-mini",
-    response_format: { type: "json_object" },
-    messages: [
-      {
-  role: "system",
-  content: `
-You are a YouTube thumbnail CTR expert.
-
-IMPORTANT RULE:
-All ratio values MUST be between 0.0 and 1.0 only.
-Never use 0-100 scale for ratios.
-
-All bbox values (x,y,w,h) MUST be between 0.0 and 1.0.
-Coordinates are normalized relative to full image.
-
-0.0 = none / far left / no space
-1.0 = full frame / far right / maximum
-
-CTR scores still use 1-100 scale.
-
-Return JSON only.
-`
-},
       {
         role: "user",
         content: [
           {
             type: "text",
-            text: `
-Score this thumbnail based on:
-- Face size dominance
-- Emotional clarity
-- Color contrast
-- Subject separation
-- Mobile readability
-
-Also identify:
-- art style (photorealistic, anime, cartoon, 3D render, stylized digital painting)
-- render type (AI photo, 3D game render, painted illustration)
-- character exaggeration level (0-100)
-- background complexity (0-100)
-- color palette type (warm cinematic, neon cyberpunk, pastel, dark moody)
-- outline presence (strong, soft, none)
-- subject distortion type (big head small body, normal proportion, hyper realistic)
-
-Return JSON:
-
-{
-  "visual_ctr_score": 0,
-  "face_score": 0,
-  "emotion_score": 0,
-  "color_score": 0,
-  "readability_score": 0,
-
-   // All ratio values MUST be 0.0 - 1.0
-  "face_ratio": 0.0,
-  "subject_position_x": 0.0,
-  "negative_space_ratio": 0.0,
-  "camera_distance_estimate": 0.0,
-  "horizon_line_estimate": 0.0,
-
-  "color_saturation_level": 0,
-  "contrast_strength": 0,
-  "emotion_intensity_avg": 0,
-  "background_blur_level": 0,
-  "object_density": 0,
-
-  "lighting_style": "",
-  "composition_style": "",
-  "text_position": "",
-  "realism_level": 0,
-
-  "art_style": "",
-  "render_type": "",
-  "subject_distortion_type": "",
-  "color_palette_type": "",
-
-  "face_bbox": {
-    "x": 0,
-    "y": 0,
-    "w": 0,
-    "h": 0
-  },
-
-  "text_bbox": {
-    "x": 0,
-    "y": 0,
-    "w": 0,
-    "h": 0
-  },
-
-    "color_stats": {
-    "r": { "mean": 0, "std": 0 },
-    "g": { "mean": 0, "std": 0 },
-    "b": { "mean": 0, "std": 0 }
-  },
-
-  "avg_rgb": [0, 0, 0],
-  "brightness_mean": 0,
-  "saturation_mean": 0,
-  "color_histogram": [],
-  "contrast_curve": []
-}
-`
+            text: "Return fields: visual_ctr_score, face_score, emotion_score, color_score, readability_score, face_ratio, subject_position_x, negative_space_ratio, camera_distance_estimate, horizon_line_estimate, color_saturation_level, contrast_strength, emotion_intensity_avg, background_blur_level, object_density, lighting_style, composition_style, text_position, realism_level, art_style, render_type, subject_distortion_type, color_palette_type, face_bbox, text_bbox, color_stats, avg_rgb, brightness_mean, saturation_mean, ocr_text",
           },
-          {
-            type: "image_url",
-            image_url: {
-              url: `data:image/png;base64,${base64Image}`
-            }
-          }
-        ]
-      }
-    ]
+          { type: "image_url", image_url: { url: `data:image/png;base64,${base64Image}` } },
+        ],
+      },
+    ],
   });
 
-  let content = response.choices[0].message.content;
+  const parsed = safeJsonParse(response.choices[0].message.content, null);
+  if (!parsed) return null;
 
-try {
-  const parsed = JSON.parse(content);
-function normalizeBBox(bbox) {
-  if (!bbox) return { x: 0, y: 0, w: 0, h: 0 };
-
-  function fix(v) {
-    if (typeof v !== "number") return 0;
-    if (v > 1) v = v / 100;
-    if (v < 0) v = 0;
-    if (v > 1) v = 1;
-    return Number(v.toFixed(2));
-  }
-
-  return {
-    x: fix(bbox.x),
-    y: fix(bbox.y),
-    w: fix(bbox.w),
-    h: fix(bbox.h),
-  };
-}
-
-parsed.face_bbox = normalizeBBox(parsed.face_bbox);
-parsed.text_bbox = normalizeBBox(parsed.text_bbox);
-
-  function normalizeRatio(value) {
-  if (!value) return 0;
-
-  if (value > 1.5) value = value / 100;
-
-  if (value > 1) value = 1;
-
-  if (value < 0) value = 0;
-
-  return Number(value.toFixed(3));
-}
-
-  parsed.face_ratio = normalizeRatio(parsed.face_ratio);
-  parsed.subject_position_x = normalizeRatio(parsed.subject_position_x);
-  parsed.negative_space_ratio = normalizeRatio(parsed.negative_space_ratio);
-  parsed.camera_distance_estimate = normalizeRatio(parsed.camera_distance_estimate);
-  parsed.horizon_line_estimate = normalizeRatio(parsed.horizon_line_estimate);
-
+  parsed.face_bbox = normalizeBBox(parsed.face_bbox);
+  parsed.text_bbox = normalizeBBox(parsed.text_bbox);
+  parsed.face_ratio = clamp(Number(parsed.face_ratio || 0), 0, 1);
+  parsed.subject_position_x = clamp(Number(parsed.subject_position_x || 0), 0, 1);
+  parsed.negative_space_ratio = clamp(Number(parsed.negative_space_ratio || 0), 0, 1);
+  parsed.camera_distance_estimate = clamp(Number(parsed.camera_distance_estimate || 0), 0, 1);
+  parsed.horizon_line_estimate = clamp(Number(parsed.horizon_line_estimate || 0), 0, 1);
   return parsed;
-
-} catch (err) {
-  console.error("Vision JSON parse error:", err.message);
-  console.error("Raw response was:", content);
-  return null;
 }
-}
-
 
 async function analyzeContent(data, channelDNA) {
-
-  let dnaBlock = "";
-
-  if (channelDNA) {
-    dnaBlock = `
-Channel Style Baseline:
-- Dominant lighting: ${channelDNA.dominant_lighting_style}
-- Dominant composition: ${channelDNA.dominant_composition_style}
-- Dominant text position: ${channelDNA.dominant_text_position}
-- Emotional baseline: ${channelDNA.niche_profile?.emotion_baseline}
-- Visual theme: ${channelDNA.niche_profile?.visual_theme}
-
-When generating analysis:
-Adapt to this channel identity.
-Do NOT invent random aesthetics outside this baseline.
-`;
-  }
-
   const response = await openai.chat.completions.create({
     model: "gpt-4o-mini",
     response_format: { type: "json_object" },
     messages: [
       {
         role: "system",
-        content: `
-You are an elite YouTube CTR strategist.
-
-${dnaBlock}
-
-Analyze viral psychology deeply.
-
-If the video is about a specific game (ROV, Minecraft, Valorant, etc),
-you MUST extract specific in-game objects, characters, abilities, weapons, UI elements, maps, or recognizable game visuals.
-
-Never stay generic. Be concrete and visual.
-
-Always return valid JSON only.
-`
-      },
-      {
-  role: "user",
-  content: `
-Analyze this YouTube video data and return ONLY JSON.
-
-Video topic: ${data.title}
-Description: ${data.description}
-
-Extract:
-- main subject focus
-- emotional trigger
-- key visual objects
-- visual tension level
-
-Scoring rules:
-- hook_strength (1-10)
-- emotion_intensity (1-10)
-- ctr_score (1-100)
-
-Generate 3 short powerful text variations (2-4 words each).
-
-Return:
-
-{
-  "category": "",
-  "template": "",
-  "game": "",
-  "specific_game_elements": [],
-  "visual_objects": [],
-  "environment_type": "",
-  "mood": "",
-  "focus": "",
-  "style": "",
-  "layout": "",
-  "text_hook": "",
-  "hook_strength": 0,
-  "emotion_intensity": 0,
-  "ctr_score": 0,
-  "text_variations": []
-}
-
-Video Data:
-Title: ${data.title}
-Description: ${data.description}
-Tags: ${data.tags.join(", ")}
-YouTube Category ID: ${data.categoryId}
-Views: ${data.viewCount}
-Likes: ${data.likeCount}
-`
-      }
-    ]
-  });
-
-  try {
-    return JSON.parse(response.choices[0].message.content);
-  } catch (err) {
-    console.error("Content JSON parse error:", err.message);
-    return null;
-  }
-}
-
-/* =========================
-   🔥 TEMPLATE ENGINE
-========================= */
-function applyTemplateLogic(context) {
-  switch (context.template) {
-    case "story_cards":
-      return `
-Cinematic storytelling frame,
-Character reacting emotionally,
-Background supports story tension,
-`;
-
-    case "text_on_image":
-      return `
-Large central bold text,
-Clean background,
-Face positioned side,
-`;
-
-    case "floating_proof":
-      return `
-Money or numbers floating,
-Glow effect,
-Subject reacting,
-`;
-
-    case "before_after":
-      return `
-Split screen layout,
-Clear BEFORE vs AFTER contrast,
-`;
-
-    case "podcast":
-      return `
-Two faces conversation,
-Microphone visible,
-`;
-
-    case "object_in_hand":
-      return `
-Subject holding object,
-Object emphasized clearly,
-`;
-
-    case "contextual_background":
-      return `
-Large dramatic environment,
-Environmental storytelling,
-`;
-
-    case "explainer":
-      return `
-Subject pointing at UI graphics,
-Educational vibe,
-`;
-
-    default:
-      return "";
-  }
-}
-// ===============================
-// 1️⃣ Blueprint Generator Layer
-// ===============================
-
-async function generateVisualBlueprint(videoData, dna) {
-  const response = await openai.chat.completions.create({
-    model: "gpt-4o-mini",
-    response_format: { type: "json_object" },
-    messages: [
-      {
-        role: "system",
-        content: `
-You are a visual director for high CTR YouTube thumbnails.
-Generate a strict JSON blueprint for thumbnail composition.
-Return only JSON.
-`
+        content: `You are an elite YouTube CTR strategist. Channel baseline: ${channelDNA?.niche_profile?.niche || "general"}`,
       },
       {
         role: "user",
-        content: `
-Video topic: ${videoData.topic}
-Emotion: ${videoData.emotion}
-Main subject focus: ${videoData.focus}
-Key objects: ${videoData.objects?.join(", ")}
-
-Channel niche: ${dna?.niche_profile?.niche}
-Dominant composition: ${dna?.dominant_composition_style}
-Dominant text position: ${dna?.dominant_text_position}
-
-Return JSON with this structure:
-
-{
-  framing: "",
-  subject_type: "",
-  camera_angle: "",
-  emotion_type: "",
-  lighting_type: "",
-  background_type: "",
-  text_zone: "",
-  visual_priority_order: []
-}
-`
-      }
-    ]
+        content: `Analyze video and return JSON with category, template, game, specific_game_elements, visual_objects, environment_type, mood, focus, style, layout, text_hook, hook_strength, emotion_intensity, ctr_score, text_variations.\nTitle:${data.title}\nDescription:${data.description}`,
+      },
+    ],
   });
+  return safeJsonParse(response.choices[0].message.content, null);
+}
 
-  try {
-  return JSON.parse(response.choices[0].message.content);
-} catch (err) {
-  console.error("Blueprint JSON parse error:", err.message);
-  console.error("Raw blueprint response:", response.choices[0].message.content);
-  return null;
+function mergeDNA(context, channelDNA) {
+  const n = channelDNA?.niche_profile || {};
+  return `Channel Style Baseline:
+Lighting: ${channelDNA?.dominant_lighting_style || "cinematic"}
+Composition: ${channelDNA?.dominant_composition_style || "centered"}
+Art style: ${channelDNA?.dominant_art_style || "photorealistic"}
+Color palette: ${channelDNA?.dominant_color_palette || "vivid"}
+Render type: ${channelDNA?.dominant_render_type || "digital"}
+Niche: ${n.niche || "general"}
+Primary topic: ${n.primary_topic || "general"}
+Realism: ${channelDNA?.avg_realism_level || 50}`;
 }
-}
-/* =========================
-   🔥 BUILD PROMPT
-========================= */
 
 function buildPrompt(context) {
-   let structuralInjection = "";
-   
-  if (context.dna?.avg_color_stats?.r) {
-  structuralInjection += `
-Maintain color variance similar to channel:
-Red variance ${context.dna.avg_color_stats.r.std},
-Green variance ${context.dna.avg_color_stats.g.std},
-Blue variance ${context.dna.avg_color_stats.b.std},
-`;
+  const dna = context.dna || {};
+  const textPosition = dna.dominant_text_position || "right";
+  const textB = dna.text_bbox_avg || { x: 0.7, y: 0.15, w: 0.25, h: 0.18 };
+  const faceB = dna.face_bbox_avg || { x: 0.25, y: 0.2, w: 0.35, h: 0.55 };
+  const zone = highNegativeSpaceZones(dna.negative_space_map || createGrid(0.5), 0.6);
+
+  const typographyRules = [];
+  if ((dna.uppercase_ratio || 0) > 0.7) typographyRules.push("Use ALL CAPS bold text");
+  else typographyRules.push("Use mixed-case readable bold text");
+  if (dna.dominant_text_outline) typographyRules.push("Text must have strong outline stroke");
+  typographyRules.push(`Target text area ratio: ${(dna.text_area_ratio || 0.1).toFixed(2)}`);
+  typographyRules.push(`Text position approx x=${textB.x.toFixed(2)}, y=${textB.y.toFixed(2)}`);
+  typographyRules.push("Text must not overlap face region");
+
+  const expressionRule = (dna.avg_emotion_score || 0) > 70
+    ? "Highly expressive exaggerated facial emotion"
+    : "Moderate natural facial expression";
+
+  return `${mergeDNA(context, dna)}
+-----------------------------------
+Scene:
+Main subject: ${context.focus}
+Mood: ${context.mood}
+Subject positioned around X=${(dna.subject_position_x || 0.5).toFixed(2)}
+Camera distance similar to baseline (${(dna.camera_distance_estimate || 0.5).toFixed(2)})
+Maintain composition style: ${dna.dominant_composition_style || "balanced"}
+Place text in high negative space zones (${zone})
+Avoid placing main subject in high density zones
+${expressionRule}
+-----------------------------------
+Typography:
+${typographyRules.join("\n")}
+-----------------------------------
+Thumbnail text: "${context.text_hook}"`;
 }
-  const templateInstruction = applyTemplateLogic(context);
-  // ===============================
-// 🔥 CTR ADAPTIVE TOKEN SCALING
-// ===============================
-
-let exaggerationWeight = 1.0;
-let emotionWeight = 1.0;
-let colorWeight = 1.0;
-
-if (context.dna) {
-
-  // 🔥 Visual CTR scaling
-  if (context.dna?.avg_visual_ctr > 85) {
-  exaggerationWeight = 1.5;
-  emotionWeight = 1.4;
-  colorWeight = 1.3;
-}
-else if (context.dna?.avg_visual_ctr > 75) {
-  exaggerationWeight = 1.2;
-  emotionWeight = 1.2;
-  colorWeight = 1.1;
-}
-else if (context.dna?.avg_visual_ctr < 60) {
-  exaggerationWeight = 0.9;
-  emotionWeight = 0.9;
-  colorWeight = 0.95;
-}
-
-  // 🔥 Emotion scaling
-  if (context.dna.avg_emotion_score > 75) {
-    emotionWeight = 1.4;
-  }
-
-  // 🔥 Color scaling
-  if (context.dna.avg_color_score > 75) {
-    colorWeight = 1.4;
-  }
-}
-  let blueprintBlock = "";
-
-  
-
-if (context.dna?.avg_contrast_curve?.length) {
-  structuralInjection += `
-(contrast curve profile: ${context.dna.avg_contrast_curve.join(", ")}:1.4),
-`;
-}
-
-if (context.dna?.avg_color_histogram?.length) {
-  structuralInjection += `
-(color histogram profile: ${context.dna.avg_color_histogram.join(", ")}:1.4),
-`;
-}
-  
-
-if (context.blueprint) {
-  blueprintBlock = `
-Framing: ${context.blueprint.framing}
-Subject type: ${context.blueprint.subject_type}
-Camera angle: ${context.blueprint.camera_angle}
-Emotion type: ${context.blueprint.emotion_type}
-Lighting: ${context.blueprint.lighting_type}
-Background: ${context.blueprint.background_type}
-Text zone: ${context.blueprint.text_zone}
-Visual priority: ${context.blueprint.visual_priority_order.join(", ")}
-`;
-}
-  let videoContextBlock = `
-Based on actual YouTube video:
-Title: ${context.videoTitle},
-Description summary: ${context.videoDescription?.slice(0, 300)},
-Core tags: ${context.videoTags?.slice(0, 8).join(", ")},
-
-Visual storytelling must reflect this topic accurately.
-`;
-let nicheBlock = "";
-
-if (context.dna?.niche_profile) {
-
-  const niche = context.dna.niche_profile;
-
-  nicheBlock = `
-Channel Niche Intelligence:
-Main niche: ${niche.niche},
-Primary topic: ${niche.primary_topic},
-Common visual objects: ${niche.common_objects?.join(", ")},
-Emotional baseline: ${niche.emotion_baseline},
-Visual theme direction: ${niche.visual_theme},
-
-Adapt to this channel identity while improving CTR potential.
-`;
-}
-  // 🧬 DNA LAYOUT OVERRIDE
-let dnaLayoutOverride = "";
-
-if (context.dna && context.dna.sample_size >= 8) {
-
-  if (context.dna?.dominant_composition_style?.includes("split")) {
-    dnaLayoutOverride += `
-Split screen composition,
-Clear left vs right separation,
-Strong visual contrast between sides,
-`;
-  }
-
-  if (context.dna.dominant_composition_style?.includes("center")) {
-    dnaLayoutOverride += `
-Centered face dominance,
-Symmetrical composition,
-Face placed dead center,
-`;
-  }
-
-  if (context.dna.dominant_composition_style?.includes("side")) {
-    dnaLayoutOverride += `
-Subject on one side,
-Large empty space for bold text,
-Asymmetrical thumbnail layout,
-`;
-  }
-
-}
-  if (!context.dna || context.dna.sample_size < 8) {
-  context.dna = null;
-}
-let dnaBoost = "";
-
-  // 🎨 GLOBAL COLOR LOCK (Always applied)
-let colorLock = `
-high contrast lighting,
-professional youtube thumbnail color grading,
-`;
-
-if (context.dna && context.dna.dominant_lighting_style?.includes("soft")) {
-  colorLock = `
-soft cinematic lighting,
-natural color grading,
-`;
-} else {
-  colorLock = `
-(high contrast:${colorWeight}),
-(neon rim light:${colorWeight}),
-(cinematic lighting:1.3),
-`;
-}
-// 🧱 BACKGROUND STRUCTURE LOCK (Always applied)
-let backgroundLock = `
-foreground subject dominant,
-background slightly blurred but colorful,
-big shapes,
-clean composition,
-clear separation,
-`;
-let styleSignatureBlock = "";
-
-let colorVectorLock = "";
-
-
-if (context.dna?.avg_rgb) {
-  colorVectorLock = `
-Average RGB tone: ${context.dna.avg_rgb.join(", ")},
-Match overall brightness ${context.dna.brightness_mean},
-Match saturation level ${context.dna.saturation_mean},
-Keep color grading consistent with channel identity,
-`;
-}
-
-let geometryControl = "";
-
-if (context.dna?.negative_space_ratio > 0.4) {
-  geometryControl += `
-Large empty negative space preserved,
-`;
-}
-
-if (context.dna?.camera_distance_estimate > 0.6) {
-  geometryControl += `
-Medium camera distance framing,
-`;
-} else {
-  geometryControl += `
-Close-up framing,
-`;
-}
-if (context.dna?.dominant_art_style) {
-  styleSignatureBlock = `
-Art style: ${context.dna.dominant_art_style}
-Rendering type: ${context.dna.dominant_render_type}
-Color palette direction: ${context.dna.dominant_color_palette}
-Character distortion: ${context.dna.dominant_distortion}
-`;
-}
-let vectorControl = "";
-
-if (context.dna?.face_ratio) {
-  vectorControl += `
-Face occupies ${(context.dna.face_ratio * 100).toFixed(0)}% of frame,
-`;
-}
-
-if (context.dna?.subject_position_x < 0.4) {
-  vectorControl += `
-Subject positioned on left side,
-`;
-}
-
-if (context.dna?.subject_position_x > 0.6) {
-  vectorControl += `
-Subject positioned on right side,
-`;
-}
-
-// 🎯 MASTER STYLE CORE (Refined)
-let masterStyleCore = "";
-
-if (context.dna && context.dna.avg_face_score < 60) {
-  masterStyleCore = `
-Waist up framing,
-Environment visible,
-Less extreme close up,
-Balanced composition,
-`;
-} else {
-  masterStyleCore = `
-
-face dominant but not centered,
-(strong emotional intensity:${exaggerationWeight}),
-`;
-}
-// 🎯 MICRO DETAIL REFINEMENT
-let microRefinement = `
-natural skin texture,
-realistic facial lighting transitions,
-subtle color harmony,
-professional youtube thumbnail polish,
-balanced highlights and shadows
-`;
-    // 🔥 STYLE LOCK (Thumbmagic-like)
-let styleLock = `
-Medium close-up,
-face filling 65% of frame,
-24mm ultra wide lens distortion,
-head near top frame edge,
-
-intense facial expression,
-mouth slightly open,
-dramatic eyebrows,
-
-hyper saturated colors,
-high contrast lighting,
-neon rim light,
-cinematic thumbnail style,
-
-clean bold background,
-colorful environment,
-foreground dominance,
-sharp focus,
-`;
-// 🧬 LAYOUT DNA MAPPING (REAL STRUCTURE CONTROL)
-let layoutDNA = "";
-
-if (context.dna && context.dna.dominant_composition_style) {
-
-  if (context.dna.dominant_composition_style.includes("side")) {
-    layoutDNA = `
-    (subject positioned on left third:1.6),
-    (large empty negative space on right for text:1.6),
-    (asymmetrical composition:1.5),
-    (rule of thirds framing:1.4),
-    (subject NOT centered:1.6),
-    `;
-  }
-
-  else if (context.dna.dominant_composition_style.includes("center")) {
-    layoutDNA = `
-    (strong centered face dominance:1.4),
-    (symmetrical composition:1.3),
-    (balanced layout:1.2),
-    `;
-  }
-
-  else if (context.dna.dominant_composition_style.includes("split")) {
-    layoutDNA = `
-    (split screen composition:1.6),
-    (clear left vs right contrast:1.5),
-    (strong visual separation:1.4),
-    `;
-  }
-}
-
-
-  // ===============================
-// 🧬 DNA STRUCTURAL LAYOUT ENGINE
-// ===============================
-
-let framing = "";
-let compositionControl = "";
-let textZoneControl = "";
-
-if (context.dna && context.dna.sample_size >= 8) {
-
-  const comp = context.dna.dominant_composition_style || "";
-  const textPos = context.dna.dominant_text_position || "";
-
-  // 🎯 COMPOSITION CONTROL
-   if (comp.includes("dynamic")) {
-  compositionControl = `
-Dynamic diagonal composition,
-Energy flow across frame,
-Asymmetrical balance,
-`;
-  framing = "Medium close-up dynamic angle,";
-}
-  if (comp.includes("split")) {
-    compositionControl = `
-Split screen layout,
-Left vs right visual contrast,
-Clear visual separation line,
-One side face, other side supporting element,
-`;
-    framing = "Face occupies 45% of frame,";
-  }
-
-  else if (comp.includes("side")) {
-    compositionControl = `
-Subject positioned on one side,
-Strong empty negative space on opposite side,
-Asymmetrical layout,
-`;
-    framing = "Face filling 50% of frame, offset to side,";
-  }
-
-  else {
-    compositionControl = `
-Centered dominant subject,
-Symmetrical composition,
-`;
-    framing = "Extreme close-up face filling 70% of frame,";
-  }
-
-  // 📝 TEXT ZONE CONTROL
-  if ((textPos || "").includes("top")) {
-    textZoneControl = `
-Top 25% of frame reserved for text,
-Face positioned slightly lower,
-Clear text-safe zone at top,
-`;
-  }
-
-  else if (textPos.includes("bottom")) {
-    textZoneControl = `
-Bottom 25% reserved for bold text,
-Face positioned slightly higher,
-Clear text-safe zone at bottom,
-`;
-  }
-
-  else {
-    textZoneControl = `
-Text positioned beside subject in negative space,
-Avoid overlapping face,
-`;
-  }
-
-} else {
-  // fallback
-  framing = "Extreme close-up face filling 70% of frame,";
-  compositionControl = "Centered subject composition,";
-  textZoneControl = "Text placed beside subject,";
-}
-
-if (context.dna && context.dna.avg_face_score > 60) {
-  framing = "Medium close-up, face filling 50% of frame,";
-} else {
-  framing = "Waist up framing, environment visible,";
-}
-  if (context.dna) {
-  dnaBoost += `(${context.dna.dominant_lighting_style} lighting:1.3),\n`;
-  dnaBoost += `(${context.dna.dominant_composition_style}:1.2),\n`;
-  dnaBoost += `(Text at ${context.dna.dominant_text_position}:1.2),\n`;
-}
-
-  if (context.dna) {
-    if (context.dna.dominant_art_style) {
-  dnaBoost += `${context.dna.dominant_art_style} style,\n`;
-}
-
-if (context.dna.dominant_render_type) {
-  dnaBoost += `${context.dna.dominant_render_type} rendering,\n`;
-}
-
-if (context.dna.dominant_distortion) {
-  dnaBoost += `${context.dna.dominant_distortion} character proportion,\n`;
-}
-
-if (context.dna.dominant_color_palette) {
-  dnaBoost += `${context.dna.dominant_color_palette} color palette,\n`;
-}
-
-
-    if (context.dna.avg_color_score > 75) {
-      dnaBoost += "Extremely vibrant saturated colors, aggressive contrast,\n";
-    }
-
-    if (context.dna.avg_readability_score > 75) {
-      dnaBoost += "Huge bold text, maximum readability for mobile,\n";
-    }
-
-    if (context.dna.avg_emotion_score > 75) {
-      dnaBoost += "Extreme emotional exaggeration, dramatic facial intensity,\n";
-    }
-
-
-
-    if (context.dna.dominant_text_position) {
-      dnaBoost += `Thumbnail text positioned at ${context.dna.dominant_text_position},\n`;
-    }
-
-    if (context.dna.avg_realism_level > 60) {
-      dnaBoost += "Ultra realistic photo style,\n";
-    } else {
-      dnaBoost += "Slightly stylized cinematic look,\n";
-    }
-  }
-// 🎭 MOOD ADAPTIVE EXPRESSION
-let moodExpression = `(strong emotional expression:${emotionWeight}),`;
-
-if (context.mood?.includes("serious")) {
-  moodExpression = `(focused intense stare:${emotionWeight}),`;
-}
-
-if (context.mood?.includes("sad")) {
-  moodExpression = `(subtle emotional sadness:${emotionWeight}),`;
-}
-
-if (context.mood?.includes("educational")) {
-  moodExpression = `(confident explanatory expression:${emotionWeight}),`;
-}
-
-if (context.mood?.includes("excited")) {
-  moodExpression = `(extreme shocked face:${emotionWeight}),`;
-}
-
-// 🧬 MERGE OBJECTS (video + channel DNA)
-let mergedObjects = [
-  ...(context.visual_objects || []),
-  ...(context.dna?.niche_profile?.common_objects || [])
-];
-
-// ลบตัวซ้ำ
-mergedObjects = [...new Set(mergedObjects)];
-
-let visualObjectBlock = "";
-
-if (mergedObjects.length > 0) {
-  visualObjectBlock = `
-Include specific recognizable visual elements:
-${mergedObjects.join(", ")}
-
-Make these elements clearly visible and important in the composition.
-`;
-}
-return `
-${nicheBlock}
-
-High CTR ${context.category} YouTube thumbnail,
-
-${videoContextBlock}
-${visualObjectBlock}
- ${vectorControl}
-${blueprintBlock}
-${layoutDNA}
-
-${templateInstruction}
-
-${colorLock}
-
-${backgroundLock}
-
-${microRefinement}
-
-${styleSignatureBlock}
-
-${structuralInjection}
-
-${colorVectorLock}
-
-${geometryControl}
-
-${dnaBoost}
-
-Main subject: ${context.focus},
-${framing}
-Head near top frame edge,
-Foreground dominance,
-
-${moodExpression}
-Strong expression clarity,
-
-Thumbnail text: "${context.text_hook}",
-Large bold readable text,
-2-4 words only,
-High contrast yellow or white typography,
-
-Clear foreground subject,
-Separated midground,
-Strong subject-background separation,
-
-Optimized for small mobile view clarity,
-${context.dna?.camera_distance_estimate > 0.6
-  ? "Medium lens perspective,"
-  : "Wide angle perspective,"}
-(slight caricature exaggeration:${exaggerationWeight}),
-Foreground subject oversized,
-Environment readable and colorful,
-`;
-}
-
 
 function buildNegativePrompt() {
-  return `
-blurry,
-low quality,
-extra fingers,
-bad anatomy,
-watermark,
-text artifacts,
-logo,
-
-neon circle,
-neon ring behind head,
-perfect circular halo,
-symmetrical background pattern,
-
-low contrast,
-flat lighting,
-boring expression,
-small face,
-far camera,
-realistic documentary style,
-`;
+  return "blurry, low quality, bad anatomy, watermark, text artifacts, overlapping text on face";
 }
 
-/* =========================
-   🔥 YOUTUBE FETCH
-========================= */
+function clip01(v) {
+  return clamp(Number(v || 0), 0, 1);
+}
+
+function updateDNAFromWinner(channelId, winner, channelDNA) {
+  if (!channelDNA || !winner) return;
+  const alpha = 0.15;
+  const dnaPath = path.join(DNA_DIR, `${channelId}.json`);
+
+  const blend = (oldV, newV) => Number((oldV + alpha * (newV - oldV)).toFixed(4));
+
+  channelDNA.sample_size = Math.min(200, (channelDNA.sample_size || 0) + 1);
+  channelDNA.avg_visual_ctr = Math.round(blend(channelDNA.avg_visual_ctr || 50, winner.vision_score || 50));
+  channelDNA.subject_position_x = blend(channelDNA.subject_position_x || 0.5, winner.subject_position_x || channelDNA.subject_position_x || 0.5);
+  channelDNA.emotion_intensity_avg = blend(channelDNA.emotion_intensity_avg || 50, winner.emotion_score || channelDNA.emotion_intensity_avg || 50);
+  channelDNA.color_saturation_level = blend(channelDNA.color_saturation_level || 50, winner.color_score || channelDNA.color_saturation_level || 50);
+  channelDNA.contrast_strength = blend(channelDNA.contrast_strength || 50, winner.readability_score || channelDNA.contrast_strength || 50);
+  channelDNA.negative_space_ratio = blend(channelDNA.negative_space_ratio || 0.5, winner.negative_space_ratio || channelDNA.negative_space_ratio || 0.5);
+
+  fs.writeFileSync(dnaPath, JSON.stringify(channelDNA, null, 2));
+}
+
 async function getYouTubeData(videoId) {
-  const response = await axios.get(
-    "https://www.googleapis.com/youtube/v3/videos",
-    {
-      params: {
-        part: "snippet,statistics",
-        id: videoId,
-        key: YOUTUBE_API_KEY,
-      },
-    }
-  );
-
-  if (!response.data.items.length) {
-    throw new Error("Video not found");
-  }
-
+  const response = await youtubeGet("https://www.googleapis.com/youtube/v3/videos", {
+    part: "snippet,statistics",
+    id: videoId,
+    key: YOUTUBE_API_KEY,
+  });
+  if (!response.data.items.length) throw new Error("Video not found");
   const video = response.data.items[0];
-
   return {
     title: video.snippet.title,
     description: video.snippet.description,
@@ -1599,294 +486,416 @@ async function getYouTubeData(videoId) {
     likeCount: video.statistics.likeCount,
   };
 }
+
 function calculateFinalScore(analysis) {
-  const ctrWeight = 0.5;
-  const hookWeight = 0.3;
-  const emotionWeight = 0.2;
-
-  return (
-    analysis.ctr_score * ctrWeight +
-    analysis.hook_strength * 10 * hookWeight +
-    analysis.emotion_intensity * 10 * emotionWeight
-  );
+  return analysis.ctr_score * 0.5 + analysis.hook_strength * 10 * 0.3 + analysis.emotion_intensity * 10 * 0.2;
 }
-async function getChannelIdFromVideo(videoId) {
-  try {
-    const response = await axios.get(
-      "https://www.googleapis.com/youtube/v3/videos",
-      {
-        params: {
-          part: "snippet",
-          id: videoId,
-          key: process.env.YOUTUBE_API_KEY,
-        },
-      }
-    );
 
-    const items = response.data.items;
-    if (!items || items.length === 0) {
-      throw new Error("Video not found");
+async function getChannelIdFromVideo(videoId) {
+  const response = await youtubeGet("https://www.googleapis.com/youtube/v3/videos", {
+    part: "snippet",
+    id: videoId,
+    key: YOUTUBE_API_KEY,
+  });
+  if (!response.data.items?.length) throw new Error("Video not found");
+  return response.data.items[0].snippet.channelId;
+}
+
+function findNodeByType(workflow, type) {
+  return Object.keys(workflow).find((key) => workflow[key].class_type === type);
+}
+
+function resolvePromptNodes(workflow) {
+  const clipNodes = Object.keys(workflow).filter((k) => workflow[k].class_type === "CLIPTextEncode");
+  if (clipNodes.length < 2) return { positiveNode: null, negativeNode: null };
+
+  const looksNegative = (node) => {
+    const title = String(node?._meta?.title || "").toLowerCase();
+    const t = String(node?.inputs?.text || "").toLowerCase();
+    return title.includes("negative")
+      || t.includes("low quality")
+      || t.includes("blurry")
+      || t.includes("low contrast")
+      || t.includes("bad anatomy");
+  };
+
+  const negativeNode = clipNodes.find((k) => looksNegative(workflow[k])) || clipNodes[1];
+  const positiveNode = clipNodes.find((k) => k !== negativeNode) || clipNodes[0];
+  return { positiveNode, negativeNode };
+}
+
+async function waitForComfyImage(promptId, maxAttempts = 45, delayMs = 2000) {
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    await new Promise((r) => setTimeout(r, delayMs));
+    try {
+      const history = await axios.get(`${COMFY_URL}/history/${promptId}`);
+      const outputs = history.data[promptId]?.outputs;
+      if (!outputs) continue;
+      for (const nodeId of Object.keys(outputs)) {
+        if (outputs[nodeId].images?.length) return outputs[nodeId].images[0].filename;
+      }
+    } catch (_err) {
+      // continue polling
+    }
+  }
+  return null;
+}
+
+app.get("/analyze-channel", async (req, res) => {
+  try {
+    const channelId = req.query.channel_id;
+    if (!channelId) return res.json({ error: "channel_id is required" });
+
+    const cacheKey = `analyze:${channelId}`;
+    const cached = analyzeCache.get(cacheKey);
+    if (cached && Date.now() - cached.ts < CACHE_TTL_MS) {
+      return res.json({ status: "dna_cached", dna: cached.data });
     }
 
-    return items[0].snippet.channelId;
-  } catch (error) {
-    console.error("Error getting channelId:", error.message);
-    throw error;
+    const videoDetails = await getChannelVideoDetails(channelId);
+    const nicheProfile = await analyzeChannelNiche(videoDetails);
+    const videos = await getChannelVideos(channelId);
+    if (!videos.length) return res.json({ error: "No videos found" });
+
+    const oldDNA = loadChannelDNA(channelId);
+
+    const totals = {
+      total: 0,
+      face: 0,
+      emotion: 0,
+      color: 0,
+      readability: 0,
+      faceRatio: 0,
+      subjectPos: 0,
+      saturation: 0,
+      contrast: 0,
+      emotionIntensity: 0,
+      blur: 0,
+      objectDensity: 0,
+      brightness: 0,
+      saturationMean: 0,
+      realism: 0,
+      negativeSpace: 0,
+      horizon: 0,
+      cameraDistance: 0,
+      uppercaseRatio: 0,
+      textAreaRatio: 0,
+      avgWordCount: 0,
+    };
+
+    const avgRGBTotal = [0, 0, 0];
+    const sumR = new Array(256).fill(0);
+    const sumG = new Array(256).fill(0);
+    const sumB = new Array(256).fill(0);
+    let histogramCount = 0;
+
+    const lightingStyles = [];
+    const compositionStyles = [];
+    const textPositions = [];
+    const artStyles = [];
+    const renderTypes = [];
+    const distortionTypes = [];
+    const colorPalettes = [];
+    const fontWeights = [];
+    const textOutlines = [];
+
+    const faceBBoxTotal = { x: 0, y: 0, w: 0, h: 0 };
+    const textBBoxTotal = { x: 0, y: 0, w: 0, h: 0 };
+
+    const occupancyAccum = createGrid(0);
+    const analyzed = [];
+
+    for (const video of videos) {
+      try {
+        const imageResp = await axios.get(video.thumbnail, { responseType: "arraybuffer" });
+        let processedImage = Buffer.from(imageResp.data);
+
+        const realHist = await getHistogram(processedImage);
+        for (let i = 0; i < 256; i += 1) {
+          sumR[i] += realHist.rHist[i];
+          sumG[i] += realHist.gHist[i];
+          sumB[i] += realHist.bHist[i];
+        }
+        histogramCount += 1;
+
+        if (oldDNA?.avg_color_stats?.r) processedImage = await colorTransfer(processedImage, oldDNA.avg_color_stats);
+
+        const vision = await analyzeImageWithVision(processedImage);
+        if (!vision) continue;
+
+        const typo = inferTypographyStats(vision);
+        totals.uppercaseRatio += typo.uppercase_ratio;
+        totals.textAreaRatio += typo.text_area_ratio;
+        totals.avgWordCount += typo.avg_word_count;
+        fontWeights.push(typo.dominant_font_weight);
+        textOutlines.push(typo.dominant_text_outline);
+
+        if (vision.face_bbox) {
+          faceBBoxTotal.x += vision.face_bbox.x;
+          faceBBoxTotal.y += vision.face_bbox.y;
+          faceBBoxTotal.w += vision.face_bbox.w;
+          faceBBoxTotal.h += vision.face_bbox.h;
+        }
+        if (vision.text_bbox) {
+          textBBoxTotal.x += vision.text_bbox.x;
+          textBBoxTotal.y += vision.text_bbox.y;
+          textBBoxTotal.w += vision.text_bbox.w;
+          textBBoxTotal.h += vision.text_bbox.h;
+        }
+
+        addBoxToGrid(occupancyAccum, vision.face_bbox, 1);
+        addBoxToGrid(occupancyAccum, vision.text_bbox, 1);
+
+        lightingStyles.push(vision.lighting_style);
+        compositionStyles.push(vision.composition_style);
+        textPositions.push(vision.text_position);
+        artStyles.push(vision.art_style);
+        renderTypes.push(vision.render_type);
+        distortionTypes.push(vision.subject_distortion_type);
+        colorPalettes.push(vision.color_palette_type);
+
+        totals.total += vision.visual_ctr_score || 0;
+        totals.face += vision.face_score || 0;
+        totals.emotion += vision.emotion_score || 0;
+        totals.color += vision.color_score || 0;
+        totals.readability += vision.readability_score || 0;
+        totals.faceRatio += vision.face_ratio || 0;
+        totals.subjectPos += vision.subject_position_x || 0;
+        totals.saturation += vision.color_saturation_level || 0;
+        totals.contrast += vision.contrast_strength || 0;
+        totals.emotionIntensity += vision.emotion_intensity_avg || 0;
+        totals.blur += vision.background_blur_level || 0;
+        totals.objectDensity += vision.object_density || 0;
+        totals.brightness += vision.brightness_mean || 0;
+        totals.saturationMean += vision.saturation_mean || 0;
+        totals.realism += vision.realism_level || 0;
+        totals.negativeSpace += vision.negative_space_ratio || 0;
+        totals.horizon += vision.horizon_line_estimate || 0;
+        totals.cameraDistance += vision.camera_distance_estimate || 0;
+
+        if (vision.avg_rgb) {
+          avgRGBTotal[0] += vision.avg_rgb[0] || 0;
+          avgRGBTotal[1] += vision.avg_rgb[1] || 0;
+          avgRGBTotal[2] += vision.avg_rgb[2] || 0;
+        }
+
+        analyzed.push({ videoId: video.videoId, ...vision });
+      } catch (err) {
+        console.log("Skip error:", err.message);
+      }
+    }
+
+    const count = analyzed.length;
+    if (!count) return res.json({ error: "No thumbnails analyzed" });
+
+    const normalize = (arr) => {
+      const sum = arr.reduce((a, b) => a + b, 0);
+      if (sum === 0) return new Array(arr.length).fill(1 / arr.length);
+      return arr.map((v) => v / sum);
+    };
+
+    const avgR = sumR.map((v) => v / Math.max(histogramCount, 1));
+    const avgG = sumG.map((v) => v / Math.max(histogramCount, 1));
+    const avgB = sumB.map((v) => v / Math.max(histogramCount, 1));
+    const avgColorStats = {
+      r: { std: 40, mean: avgRGBTotal[0] / count },
+      g: { std: 40, mean: avgRGBTotal[1] / count },
+      b: { std: 40, mean: avgRGBTotal[2] / count },
+    };
+
+    const subjectDensityMap = normalizeGrid(occupancyAccum, count);
+    const negativeSpaceMap = subjectDensityMap.map((row) => row.map((v) => Number((1 - v).toFixed(4))));
+
+    const dna = {
+      channel_id: channelId,
+      niche_profile: nicheProfile,
+      sample_size: count,
+      analyzed_at: new Date().toISOString(),
+      avg_color_stats: avgColorStats,
+      avg_color_histogram_256: { rHist: normalize(avgR), gHist: normalize(avgG), bHist: normalize(avgB) },
+      face_bbox_avg: {
+        x: Number((faceBBoxTotal.x / count).toFixed(3)),
+        y: Number((faceBBoxTotal.y / count).toFixed(3)),
+        w: Number((faceBBoxTotal.w / count).toFixed(3)),
+        h: Number((faceBBoxTotal.h / count).toFixed(3)),
+      },
+      text_bbox_avg: {
+        x: Number((textBBoxTotal.x / count).toFixed(3)),
+        y: Number((textBBoxTotal.y / count).toFixed(3)),
+        w: Number((textBBoxTotal.w / count).toFixed(3)),
+        h: Number((textBBoxTotal.h / count).toFixed(3)),
+      },
+      subject_density_map: subjectDensityMap,
+      negative_space_map: negativeSpaceMap,
+      face_ratio: Number((totals.faceRatio / count).toFixed(3)),
+      subject_position_x: Number((totals.subjectPos / count).toFixed(3)),
+      color_saturation_level: Number((totals.saturation / count).toFixed(2)),
+      contrast_strength: Number((totals.contrast / count).toFixed(2)),
+      emotion_intensity_avg: Number((totals.emotionIntensity / count).toFixed(2)),
+      background_blur_level: Number((totals.blur / count).toFixed(2)),
+      object_density: Number((totals.objectDensity / count).toFixed(2)),
+      avg_rgb: [Math.round(avgRGBTotal[0] / count), Math.round(avgRGBTotal[1] / count), Math.round(avgRGBTotal[2] / count)],
+      brightness_mean: Number((totals.brightness / count).toFixed(2)),
+      saturation_mean: Number((totals.saturationMean / count).toFixed(2)),
+      negative_space_ratio: Number((totals.negativeSpace / count).toFixed(2)),
+      horizon_line_estimate: Number((totals.horizon / count).toFixed(2)),
+      camera_distance_estimate: Number((totals.cameraDistance / count).toFixed(2)),
+      dominant_art_style: mostCommon(artStyles),
+      dominant_render_type: mostCommon(renderTypes),
+      dominant_distortion: mostCommon(distortionTypes),
+      dominant_color_palette: mostCommon(colorPalettes),
+      dominant_lighting_style: mostCommon(lightingStyles),
+      dominant_composition_style: mostCommon(compositionStyles),
+      dominant_text_position: mostCommon(textPositions),
+      avg_visual_ctr: Math.round(totals.total / count),
+      avg_face_score: Math.round(totals.face / count),
+      avg_emotion_score: Math.round(totals.emotion / count),
+      avg_color_score: Math.round(totals.color / count),
+      avg_readability_score: Math.round(totals.readability / count),
+      avg_realism_level: Math.round(totals.realism / count),
+      uppercase_ratio: Number((totals.uppercaseRatio / count).toFixed(3)),
+      dominant_text_outline: mostCommon(textOutlines) === "1" || mostCommon(textOutlines) === 1 ? 1 : 0,
+      dominant_font_weight: mostCommon(fontWeights) || "bold",
+      text_area_ratio: Number((totals.textAreaRatio / count).toFixed(3)),
+      avg_word_count: Number((totals.avgWordCount / count).toFixed(3)),
+    };
+
+    saveChannelDNA(channelId, dna);
+
+    // optional controlnet mask
+    if (String(req.query.controlnet_mask || "0") === "1") {
+      const maskPath = path.join(TEMP_DIR, `mask_${channelId}.png`);
+      await createControlNetMaskFromDensityMap(dna.subject_density_map, maskPath);
+      dna.controlnet_mask_path = maskPath;
+    }
+
+    analyzeCache.set(cacheKey, { ts: Date.now(), data: dna });
+    return res.json({ status: "dna_created", dna });
+  } catch (err) {
+    console.error(err);
+    return res.json({ error: err.message });
   }
-}
-function findNodeByType(workflow, type) {
-  return Object.keys(workflow).find(
-    key => workflow[key].class_type === type
-  );
-}
-/* =========================
-   🚀 GENERATE THUMBNAILS
-========================= */
+});
+
 app.get("/generate-thumbnail", async (req, res) => {
+  await comfySemaphore.acquire();
   try {
     const videoId = req.query.video_id;
     const version = req.query.workflow_version || "thumbmagic_core_v1.json";
+    if (!videoId) return res.json({ error: "video_id is required" });
 
-    const baseWorkflow = JSON.parse(
-      fs.readFileSync(`./workflows/${version}`, "utf-8")
-    );
+    const baseWorkflow = safeJsonParse(fs.readFileSync(`./workflows/${version}`, "utf-8"), null);
+    if (!baseWorkflow) return res.json({ error: "invalid workflow json" });
 
     const youtubeData = await getYouTubeData(videoId);
+    const channelId = await getChannelIdFromVideo(videoId);
+    const channelDNA = loadChannelDNA(channelId);
+    const analysis = await analyzeContent(youtubeData, channelDNA);
+    if (!analysis) return res.json({ error: "Content analysis failed" });
 
-// 1️⃣ หา channel ก่อน
-const channelId = await getChannelIdFromVideo(videoId);
+    const textOptions = Array.isArray(analysis.text_variations) && analysis.text_variations.length
+      ? analysis.text_variations
+      : [analysis.text_hook || "Must Watch"];
 
-// 2️⃣ โหลด DNA ก่อน
-const channelDNA = loadChannelDNA(channelId);
-
-console.log("Channel ID:", channelId);
-console.log("Loaded DNA:", channelDNA);
-
-// 3️⃣ ค่อยวิเคราะห์ content พร้อม DNA
-const analysis = await analyzeContent(youtubeData, channelDNA);
-
-if (!analysis) {
-  return res.json({ error: "Content analysis failed" });
-}
-
-console.log("Channel ID:", channelId);
-console.log("Loaded DNA:", channelDNA);
-// 🔥 Generate Blueprint ก่อน
-// 🔥 Generate Blueprint ก่อน
-let blueprint = await generateVisualBlueprint(
-  {
-    topic: youtubeData.title,
-    emotion: analysis.mood,
-    focus: analysis.focus,
-    objects: analysis.visual_objects
-  },
-  channelDNA
-);
-
-if (!blueprint) {
-  console.log("⚠️ Blueprint fallback used");
-  blueprint = {
-    framing: "Extreme close-up",
-    subject_type: "face",
-    camera_angle: "front",
-    emotion_type: analysis.mood || "intense",
-    lighting_type: channelDNA?.dominant_lighting_style || "cinematic",
-    background_type: "blurred colorful",
-    text_zone: channelDNA?.dominant_text_position || "side",
-    visual_priority_order: ["face", "text", "object"]
-  };
-}
-    const context = {
-  template: analysis.template || "story_cards",
-  category: analysis.category || "general",
-  focus: analysis.focus || "",
-  mood: analysis.mood || "",
-  style: analysis.style || "",
-  text_hook: analysis.text_hook || "",
-  visual_objects: analysis.visual_objects || [],
-  dna: channelDNA,
-blueprint: blueprint,
-  // 🔥 เพิ่มส่วนนี้
-  videoTitle: youtubeData.title,
-  videoDescription: youtubeData.description,
-  videoTags: youtubeData.tags,
-  viewCount: youtubeData.viewCount,
-  likeCount: youtubeData.likeCount
-};
-
-    
     const negativePrompt = buildNegativePrompt();
-
-    
-    
-
     const variations = [];
 
-const textOptions = Array.isArray(analysis.text_variations) && analysis.text_variations.length
-  ? analysis.text_variations
-  : [analysis.text_hook || "Must Watch"];
+    for (let i = 0; i < Math.min(5, textOptions.length); i += 1) {
+      const workflow = JSON.parse(JSON.stringify(baseWorkflow));
+      const finalPrompt = buildPrompt({
+        template: analysis.template || "story_cards",
+        category: analysis.category || "general",
+        focus: analysis.focus || youtubeData.title,
+        mood: analysis.mood || "intense",
+        text_hook: textOptions[i],
+        dna: channelDNA,
+      });
 
-for (let i = 0; i < textOptions.length; i++) {
+      if (DEBUG) {
+        console.log("==== FINAL PROMPT ====");
+        console.log(finalPrompt);
+      }
 
-console.log("Generating variation:", textOptions[i]);
+      const kSamplerNode = findNodeByType(workflow, "KSampler");
+      const { positiveNode, negativeNode } = resolvePromptNodes(workflow);
+      if (!positiveNode || !negativeNode) return res.json({ error: "Workflow must contain 2 CLIPTextEncode nodes (positive + negative)" });
 
-  const workflow = JSON.parse(JSON.stringify(baseWorkflow));
+      workflow[positiveNode].inputs.text = finalPrompt;
+      workflow[negativeNode].inputs.text = negativePrompt;
+      if (kSamplerNode) workflow[kSamplerNode].inputs.seed = Math.floor(Math.random() * 1000000000);
 
-  const dynamicContext = {
-    ...context,
-    text_hook: textOptions[i]
-  };
-
-  const finalPrompt = buildPrompt(dynamicContext);
-
-  const kSamplerNode = findNodeByType(workflow, "KSampler");
-
-  let positiveNode = null;
-let negativeNode = null;
-
-for (let key of Object.keys(workflow)) {
-  if (workflow[key].class_type === "CLIPTextEncode") {
-    if (!positiveNode) {
-      positiveNode = key;
-    } else {
-      negativeNode = key;
-    }
-  }
-}
-
-  if (kSamplerNode) {
-    workflow[kSamplerNode].inputs.seed = Math.floor(Math.random() * 1000000000);
-  }
-
-  if (!positiveNode || !negativeNode) {
-  return res.json({ error: "Workflow missing CLIPTextEncode nodes" });
-}
-console.log("==== FINAL PROMPT ====");
-console.log(finalPrompt);
-workflow[positiveNode].inputs.text = finalPrompt;
-workflow[negativeNode].inputs.text = negativePrompt;
-  
-
-  const comfyResponse = await axios.post(
-    `${COMFY_URL}/prompt`,
-    { prompt: workflow }
-  );
-
-  const promptId = comfyResponse.data.prompt_id;
-
-console.log("Prompt ID:", promptId);
-
-  let imageFilename = null;
-  let attempts = 0;
-
-  while (!imageFilename && attempts < 45) {
-  await new Promise((r) => setTimeout(r, 2000));
-  attempts++;
-
-  try {
-    const history = await axios.get(`${COMFY_URL}/history/${promptId}`);
-    const outputs = history.data[promptId]?.outputs;
-
-    if (outputs) {
-      for (let nodeId in outputs) {
-        if (outputs[nodeId].images) {
-          imageFilename = outputs[nodeId].images[0].filename;
-          break;
+      if (channelDNA?.subject_density_map && String(req.query.controlnet_mask || "0") === "1") {
+        const maskPath = path.join(TEMP_DIR, `gen_mask_${channelId}_${Date.now()}_${i}.png`);
+        await createControlNetMaskFromDensityMap(channelDNA.subject_density_map, maskPath);
+        // optional injection when workflow has image loader node expecting mask path
+        const maskLoaderNode = findNodeByType(workflow, "LoadImage");
+        if (maskLoaderNode && workflow[maskLoaderNode]?.inputs?.image !== undefined) {
+          workflow[maskLoaderNode].inputs.image = maskPath;
         }
       }
+
+      const comfyResponse = await axios.post(`${COMFY_URL}/prompt`, { prompt: workflow });
+      const promptId = comfyResponse.data.prompt_id;
+      const imageFilename = await waitForComfyImage(promptId);
+      if (!imageFilename) continue;
+
+      const imageUrl = `${COMFY_URL}/view?filename=${imageFilename}`;
+      const imageResponse = await axios.get(imageUrl, { responseType: "arraybuffer" });
+      let processedImage = Buffer.from(imageResponse.data);
+
+      if (channelDNA?.avg_color_histogram_256?.rHist?.length === 256) {
+        processedImage = await matchHistogram(processedImage, channelDNA.avg_color_histogram_256);
+      }
+      if (channelDNA?.avg_color_stats?.r) {
+        processedImage = await colorTransfer(processedImage, channelDNA.avg_color_stats, 0.4);
+      }
+
+      const visionAnalysis = await analyzeImageWithVision(processedImage);
+      if (!visionAnalysis) continue;
+
+      const overlap = bboxOverlapRatio(normalizeBBox(visionAnalysis.face_bbox), normalizeBBox(visionAnalysis.text_bbox));
+      if (overlap > 0.15) {
+        // regenerate policy: skip this variation if text overlaps face too much
+        continue;
+      }
+
+      variations.push({
+        text: textOptions[i],
+        image: imageUrl,
+        base_score: calculateFinalScore(analysis),
+        vision_score: visionAnalysis.visual_ctr_score,
+        face_score: visionAnalysis.face_score,
+        emotion_score: visionAnalysis.emotion_score,
+        color_score: visionAnalysis.color_score,
+        readability_score: visionAnalysis.readability_score,
+        subject_position_x: clip01(visionAnalysis.subject_position_x),
+        negative_space_ratio: clip01(visionAnalysis.negative_space_ratio),
+      });
     }
-  } catch (err) {
-    console.error("Polling error:", err.message);
-    break;
-  }
-}
 
-if (!imageFilename) {
-  console.log("⚠️ Generation timeout for prompt:", promptId);
-  continue; // ข้ามไป variation ถัดไป
-}
+    let winner = null;
+    if (variations.length > 0) {
+      winner = variations.reduce((best, current) => (current.vision_score > best.vision_score ? current : best));
+      if (winner && channelDNA) updateDNAFromWinner(channelId, winner, channelDNA);
+    }
 
-  const imageUrl = `${COMFY_URL}/view?filename=${imageFilename}`;
-
-const imageResponse = await axios.get(imageUrl, {
-  responseType: "arraybuffer"
-});
-
-const imageBuffer = Buffer.from(imageResponse.data);
-
-let processedImage = imageBuffer;
-
-// ==============================
-// 🔥 APPLY CHANNEL DNA COLOR PIPELINE
-// ==============================
-
-console.log("🔥 Applying DNA color pipeline...");
-
-// 1️⃣ Histogram Matching ก่อน
-if (channelDNA?.avg_color_histogram_256?.rHist?.length === 256) {
-
-  console.log("🔥 Applying REAL histogram matching...");
-
-  processedImage = await matchHistogram(
-    processedImage,
-    channelDNA.avg_color_histogram_256
-  );
-
-} else {
-  console.log("⚠️ Histogram missing — skipping histogram match");
-}
-// 2️⃣ Color Transfer แบบ weight
-if (channelDNA?.avg_color_stats?.r) {
-  processedImage = await colorTransfer(
-    processedImage,
-    channelDNA.avg_color_stats,
-    0.4
-  );
-}
-
-
-// 🔥 วิเคราะห์ด้วยภาพที่ถูกปรับสีแล้ว
-const visionAnalysis = await analyzeImageWithVision(processedImage);
-if (!visionAnalysis) continue;
-  variations.push({
-    text: textOptions[i],
-    image: imageUrl,
-    base_score: calculateFinalScore(analysis),
-    vision_score: visionAnalysis.visual_ctr_score,
-    face_score: visionAnalysis.face_score,
-    emotion_score: visionAnalysis.emotion_score,
-    color_score: visionAnalysis.color_score,
-    readability_score: visionAnalysis.readability_score
-  });
-
-}
-  
-
-let winner = null;
-
-if (variations.length > 0) {
-  winner = variations.reduce((best, current) =>
-  current.vision_score > best.vision_score ? current : best
-);
-if (winner && channelDNA) {
-  updateDNAFromWinner(channelId, winner, channelDNA);
-}
-}
-    res.json({
-  status: "completed",
-  title: youtubeData.title,
-  overall_score: calculateFinalScore(analysis),
-  ctr_score: analysis.ctr_score,
-  hook_strength: analysis.hook_strength,
-  overall_text_score: calculateFinalScore(analysis),
-  emotion_intensity: analysis.emotion_intensity,
-  winner: winner,
-  thumbnails: variations
-});
-
+    return res.json({
+      status: "completed",
+      title: youtubeData.title,
+      overall_score: calculateFinalScore(analysis),
+      ctr_score: analysis.ctr_score,
+      hook_strength: analysis.hook_strength,
+      overall_text_score: calculateFinalScore(analysis),
+      emotion_intensity: analysis.emotion_intensity,
+      winner,
+      thumbnails: variations,
+      concurrency_limit: 2,
+    });
   } catch (err) {
     console.error(err);
-    res.json({ error: err.message });
+    return res.json({ error: err.message });
+  } finally {
+    comfySemaphore.release();
   }
 });
 
