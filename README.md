@@ -105,6 +105,11 @@
 }
 ```
 
+
+## สถานะ Face Pipeline (อัปเดตล่าสุด)
+
+ดูสรุปสถานะเทียบกับ Step 1-4 (SDXL → IP-Adapter FaceID → ReActor → CodeFormer): `docs/pipeline_status_th.md`
+
 ## การตั้งค่า ENV
 
 ```env
