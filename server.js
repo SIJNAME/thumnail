@@ -611,6 +611,13 @@ function findNodeByType(workflow, type) {
   return Object.keys(workflow).find((key) => workflow[key].class_type === type);
 }
 
+function findControlMaskLoaderNode(workflow) {
+  return Object.keys(workflow).find((key) => {
+    const node = workflow[key];
+    return node?.class_type === "LoadImage" && typeof node?.inputs?.image === "string" && node.inputs.image.includes("__CONTROLNET_MASK__");
+  });
+}
+
 async function waitForComfyImage(promptId, maxAttempts = 45, delayMs = 2000) {
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     await new Promise((r) => setTimeout(r, delayMs));
@@ -918,7 +925,7 @@ app.get("/generate-thumbnail", async (req, res) => {
         const maskPath = path.join(TEMP_DIR, `gen_mask_${channelId}_${Date.now()}_${i}.png`);
         await createControlNetMaskFromDensityMap(channelDNA.subject_density_map, maskPath);
         // optional injection when workflow has image loader node expecting mask path
-        const maskLoaderNode = findNodeByType(workflow, "LoadImage");
+        const maskLoaderNode = findControlMaskLoaderNode(workflow);
         if (maskLoaderNode && workflow[maskLoaderNode]?.inputs?.image !== undefined) {
           workflow[maskLoaderNode].inputs.image = maskPath;
         }
