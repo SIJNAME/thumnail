@@ -1,0 +1,6 @@
+.env
+.env.*
+node_modules/
+temp/
+.DS_Store
+channel_dna/
