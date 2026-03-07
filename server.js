@@ -22,7 +22,7 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const app = express();
 app.use(express.json({ limit: "20mb" }));
 
-const COMFY_URL = process.env.COMFY_URL || "http://127.0.0.1:8000";
+const COMFY_URL = process.env.COMFY_URL || "http://127.0.0.1:8188";
 const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY;
 const DNA_DIR = path.join(__dirname, "channel_dna");
 const TEMP_DIR = path.join(__dirname, "temp");
@@ -931,10 +931,7 @@ app.get("/generate-thumbnail", async (req, res) => {
         }
       }
 
-      const comfyResponse = await axios.post(`${COMFY_URL}/prompt`, {
-       prompt: workflow,
-       client_id: "thumbnail-ai"
-      });
+      const comfyResponse = await axios.post(`${COMFY_URL}/prompt`, { prompt: workflow });
       const promptId = comfyResponse.data.prompt_id;
       const imageFilename = await waitForComfyImage(promptId);
       if (!imageFilename) continue;

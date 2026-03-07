@@ -1,4 +1,237 @@
 {
+  "3": {
+    "inputs": {
+      "seed": 505928881666135,
+      "steps": 28,
+      "cfg": 6.5,
+      "sampler_name": "dpmpp_2m",
+      "scheduler": "karras",
+      "denoise": 1,
+      "model": [
+        "16",
+        0
+      ],
+      "positive": [
+        "6",
+        0
+      ],
+      "negative": [
+        "7",
+        0
+      ],
+      "latent_image": [
+        "5",
+        0
+      ]
+    },
+    "class_type": "KSampler"
+  },
+  "4": {
+    "inputs": {
+      "ckpt_name": "juggernautXL_ragnarokBy.safetensors"
+    },
+    "class_type": "CheckpointLoaderSimple"
+  },
+  "5": {
+    "inputs": {
+      "width": 1280,
+      "height": 720,
+      "batch_size": 1
+    },
+    "class_type": "EmptyLatentImage"
+  },
+  "6": {
+    "inputs": {
+      "text": "extreme close-up, thumbnail composition, dramatic lighting, high contrast, sharp focus, detailed skin, studio lighting, rim light, vibrant color, attention grabbing",
+      "clip": [
+        "10",
+        1
+      ]
+    },
+    "class_type": "CLIPTextEncode"
+  },
+  "7": {
+    "inputs": {
+      "text": "blurry, low quality, bad anatomy, flat lighting, washed out color, overexposed, extra fingers",
+      "clip": [
+        "10",
+        1
+      ]
+    },
+    "class_type": "CLIPTextEncode"
+  },
+  "8": {
+    "inputs": {
+      "samples": [
+        "3",
+        0
+      ],
+      "vae": [
+        "4",
+        2
+      ]
+    },
+    "class_type": "VAEDecode"
+  },
+  "9": {
+    "inputs": {
+      "filename_prefix": "final_thumbnail",
+      "images": [
+        "23",
+        0
+      ]
+    },
+    "class_type": "SaveImage"
+  },
+  "10": {
+    "inputs": {
+      "lora_name": "xieshisanshitu.safetensors",
+      "strength_model": 0.6,
+      "strength_clip": 0.6,
+      "model": [
+        "11",
+        0
+      ],
+      "clip": [
+        "4",
+        1
+      ]
+    },
+    "class_type": "LoraLoader"
+  },
+  "11": {
+    "inputs": {
+      "lora_name": "1708694017811508015.safetensors",
+      "strength_model": 0.4,
+      "strength_clip": 0.4,
+      "model": [
+        "4",
+        0
+      ],
+      "clip": [
+        "4",
+        1
+      ]
+    },
+    "class_type": "LoraLoader"
+  },
+  "12": {
+    "inputs": {
+      "image": "creator_face.jpg",
+      "upload": "image"
+    },
+    "class_type": "LoadImage"
+  },
+  "13": {
+    "inputs": {
+      "provider": "CUDA"
+    },
+    "class_type": "InsightFaceLoader"
+  },
+  "14": {
+    "inputs": {
+      "clip_name": "ViT-H-14-laion2B-s32B-b79K.safetensors"
+    },
+    "class_type": "CLIPVisionLoader"
+  },
+  "15": {
+    "inputs": {
+      "preset": "FACEID PLUS V2",
+      "lora_strength": 0.7,
+      "provider": "CPU",
+      "model_file": "ip-adapter-faceid-plusv2_sdxl.bin"
+    },
+    "class_type": "IPAdapterUnifiedLoaderFaceID"
+  },
+  "16": {
+    "inputs": {
+      "model": [
+        "10",
+        0
+      ],
+      "ipadapter": [
+        "15",
+        0
+      ],
+      "image": [
+        "12",
+        0
+      ],
+      "clip_vision": [
+        "14",
+        0
+      ],
+      "insightface": [
+        "13",
+        0
+      ],
+      "weight": 1.0,
+      "weight_faceidv2": 1.15,
+      "start_at": 0.0,
+      "end_at": 1.0,
+      "embeds_scaling": "V only"
+    },
+    "class_type": "IPAdapterFaceID"
+  },
+  "20": {
+    "inputs": {
+      "enabled": true,
+      "swap_model": "inswapper_128.onnx",
+      "facedetection": "retinaface_resnet50",
+      "face_restore_model": "none",
+      "source_image": [
+        "12",
+        0
+      ],
+      "input_image": [
+        "8",
+        0
+      ],
+      "source_faces_index": "0",
+      "input_faces_index": "0",
+      "console_log_level": 1
+    },
+    "class_type": "ReActorFaceSwap"
+  },
+  "21": {
+    "inputs": {
+      "image": [
+        "20",
+        0
+      ],
+      "fidelity": 0.5,
+      "codeformer_weight": 0.5,
+      "face_detection": "retinaface_resnet50"
+    },
+    "class_type": "CodeFormerFaceRestore"
+  },
+  "22": {
+    "inputs": {
+      "image": [
+        "21",
+        0
+      ],
+      "brightness": 0.02,
+      "contrast": 1.12,
+      "saturation": 1.08,
+      "gamma": 1.0
+    },
+    "class_type": "ImageColorAdjust"
+  },
+  "23": {
+    "inputs": {
+      "upscale_method": "lanczos",
+      "scale_by": 1.2,
+      "image": [
+        "22",
+        0
+      ]
+    },
+    "class_type": "ImageScaleBy"
+  }
+}
+
+{
   "10": {
     "inputs": {
       "ckpt_name": "dreamshaperXL_lightningDPMSDE.safetensors"
